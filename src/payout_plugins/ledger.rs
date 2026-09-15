@@ -93,36 +93,6 @@ impl Ledger {
         })
     }
 
-    /// Record a payout of `sats` (a negative delta). Returns the
-    /// remaining balance, or an error if the payout exceeds the balance.
-    pub fn record_payout(&self, plugin: &str, miner_id: &str, sats: u64) -> Result<u64, String> {
-        let entry = LedgerEntry {
-            plugin: plugin.to_string(),
-            miner_id: miner_id.to_string(),
-            delta_sats: -(sats as i64),
-            ts: now(),
-            block_height: 0,
-            pending: None,
-        };
-        // Compute + append while holding the lock once — `append` also
-        // locks, so releasing first would race with a concurrent payout.
-        let balance = {
-            let mut state = self.state.lock().unwrap();
-            let key = (plugin.to_string(), miner_id.to_string());
-            let balance = state.get(&key).copied().unwrap_or(0);
-            if (sats as i64) > balance {
-                return Err(format!(
-                    "payout {sats} sats exceeds accrued {balance} sats for {miner_id}"
-                ));
-            }
-            let new_balance = balance - sats as i64;
-            self.append_entry(&mut state, entry)
-                .map_err(|e| e.to_string())?;
-            new_balance
-        };
-        Ok(balance as u64)
-    }
-
     /// Peek balances for one plugin without mutating.
     pub fn balances(&self, plugin: &str) -> HashMap<String, u64> {
         self.state
@@ -136,9 +106,9 @@ impl Ledger {
 
     /// Open a pending payout: atomically debit `sats` from the accrued
     /// balance and write an unconfirmed pending entry. Call BEFORE
-    /// dispatching the payment. Returns the pending id, or an error if
-    /// the balance is insufficient. On success the miner's accrued
-    /// balance is reduced; if the payment later fails, call
+    /// dispatching the payment. Returns the remaining balance, or an
+    /// error if the balance is insufficient. On success the miner's
+    /// accrued balance is reduced; if the payment later fails, call
     /// [`Ledger::rollback_payout`] to restore it.
     pub fn begin_payout(&self, plugin: &str, miner_id: &str, sats: u64) -> Result<u64, String> {
         let entry = LedgerEntry {
@@ -152,10 +122,11 @@ impl Ledger {
                 confirmed: false,
             }),
         };
-        let pending_id = {
+        // Look up with borrowed keys — only allocate when the entry is
+        // genuinely new (append_entry's entry() call).
+        let new_balance = {
             let mut state = self.state.lock().unwrap();
-            let key = (plugin.to_string(), miner_id.to_string());
-            let balance = state.get(&key).copied().unwrap_or(0);
+            let balance = borrowed_balance(&state, plugin, miner_id);
             if (sats as i64) > balance {
                 return Err(format!(
                     "payout {sats} sats exceeds accrued {balance} sats for {miner_id}"
@@ -164,9 +135,9 @@ impl Ledger {
             let new_balance = balance - sats as i64;
             self.append_entry(&mut state, entry)
                 .map_err(|e| e.to_string())?;
-            new_balance as u64
+            new_balance
         };
-        Ok(pending_id)
+        Ok(new_balance as u64)
     }
 
     /// Confirm a pending payout after the backend reported success.
@@ -196,10 +167,7 @@ impl Ledger {
             let mut state = self.state.lock().unwrap();
             self.append_entry(&mut state, entry)
                 .map_err(|e| e.to_string())?;
-            state
-                .get(&(plugin.to_string(), miner_id.to_string()))
-                .copied()
-                .unwrap_or(0)
+            borrowed_balance(&state, plugin, miner_id)
         };
         Ok(balance as u64)
     }
@@ -224,10 +192,7 @@ impl Ledger {
             let mut state = self.state.lock().unwrap();
             self.append_entry(&mut state, entry)
                 .map_err(|e| e.to_string())?;
-            state
-                .get(&(plugin.to_string(), miner_id.to_string()))
-                .copied()
-                .unwrap_or(0)
+            borrowed_balance(&state, plugin, miner_id)
         };
         Ok(balance as u64)
     }
@@ -364,6 +329,17 @@ fn now() -> u64 {
         .as_secs()
 }
 
+/// Current balance for (plugin, miner) without allocating the key.
+/// `HashMap::get` on a `(String, String)` key requires an owned pair,
+/// so a linear scan is the allocation-free option — at pool scale
+/// (~100 miners) it beats two String builds per call.
+fn borrowed_balance(state: &HashMap<(String, String), i64>, plugin: &str, miner_id: &str) -> i64 {
+    state
+        .iter()
+        .find(|((p, m), _)| p == plugin && m == miner_id)
+        .map_or(0, |(_, v)| *v)
+}
+
 /// Convert raw balances into [`MinerBalance`] list, dropping zero entries.
 pub fn to_miner_balances(balances: HashMap<String, u64>) -> Vec<MinerBalance> {
     balances
@@ -371,6 +347,41 @@ pub fn to_miner_balances(balances: HashMap<String, u64>) -> Vec<MinerBalance> {
         .filter(|(_, sats)| *sats > 0)
         .map(|(miner_id, sats)| MinerBalance { miner_id, sats })
         .collect()
+}
+
+/// Uniform payout-failure handling for every plugin (see the
+/// error-semantics note on [`crate::payout_plugins::traits::PayoutPlugin`]):
+/// an [`crate::payout_plugins::traits::PluginError::Ambiguous`] outcome
+/// may still settle, so the pending intent stays OPEN for
+/// reconciliation; any definite pre-dispatch failure rolls the intent
+/// back, restoring the balance so the next pass retries cleanly.
+pub fn rollback_on_definite_failure(
+    ledger: &Ledger,
+    plugin: &str,
+    balance: &MinerBalance,
+    err: &crate::payout_plugins::traits::PluginError,
+) {
+    use crate::payout_plugins::traits::PluginError;
+    if matches!(err, PluginError::Ambiguous(_)) {
+        tracing::warn!(
+            plugin,
+            miner = %balance.miner_id,
+            "Payout outcome unknown ({err}) — pending intent left OPEN for reconciliation"
+        );
+        return;
+    }
+    match ledger.rollback_payout(plugin, &balance.miner_id, balance.sats) {
+        Ok(_) => tracing::warn!(
+            plugin,
+            miner = %balance.miner_id,
+            "Payout failed pre-dispatch ({err}) — balance restored, will retry"
+        ),
+        Err(re) => tracing::error!(
+            plugin,
+            miner = %balance.miner_id,
+            "Ledger rollback failed: {re}"
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -415,7 +426,10 @@ mod tests {
         ledger.accrue("cashu", "npub123", 5_000, 800).unwrap();
         ledger.accrue("cashu", "npub123", 2_500, 801).unwrap();
         assert_eq!(ledger.balances("cashu").get("npub123"), Some(&7_500));
-        let remaining = ledger.record_payout("cashu", "npub123", 7_500).unwrap();
+        let remaining = ledger
+            .begin_payout("cashu", "npub123", 7_500)
+            .and_then(|_| ledger.settle_payout("cashu", "npub123", 7_500, "op"))
+            .unwrap();
         assert_eq!(remaining, 0);
         assert!(ledger.balances("cashu").get("npub123").is_none());
     }
@@ -424,7 +438,7 @@ mod tests {
     fn payout_over_balance_rejected() {
         let ledger = tmp_ledger();
         ledger.accrue("lightning", "worker1", 100, 900).unwrap();
-        assert!(ledger.record_payout("lightning", "worker1", 101).is_err());
+        assert!(ledger.begin_payout("lightning", "worker1", 101).is_err());
         // Rejected payout must not have mutated state.
         assert_eq!(ledger.balances("lightning").get("worker1"), Some(&100));
     }
@@ -451,7 +465,8 @@ mod tests {
         {
             let ledger = Ledger::open(path.clone()).unwrap();
             ledger.accrue("cashu", "npubX", 1_000, 10).unwrap();
-            ledger.record_payout("cashu", "npubX", 400).unwrap();
+            ledger.begin_payout("cashu", "npubX", 400).unwrap();
+            ledger.settle_payout("cashu", "npubX", 400, "op").unwrap();
         }
         let reopened = Ledger::open(path).unwrap();
         assert_eq!(reopened.balances("cashu").get("npubX"), Some(&600));

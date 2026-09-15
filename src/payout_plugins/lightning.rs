@@ -25,8 +25,10 @@
 //! have no way to tell the invoice the payee actually authorized from
 //! a substituted one.
 
-use crate::payout_plugins::ledger::{Ledger, to_miner_balances};
-use crate::payout_plugins::traits::{MinerBalance, PayoutPlugin, PluginContext, PluginError};
+use crate::payout_plugins::ledger::{Ledger, rollback_on_definite_failure, to_miner_balances};
+use crate::payout_plugins::traits::{
+    MinerBalance, PayoutPlugin, PluginContext, PluginError, ambiguous_on_timeout,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -175,24 +177,27 @@ impl LightningPlugin {
     }
 
     /// Pay a BOLT11 invoice through the configured LN node (LND REST).
+    ///
+    /// Returns the payment hash on settled success. A timeout or
+    /// mid-response transport failure maps to
+    /// [`PluginError::Ambiguous`]: LND may still settle the payment in
+    /// flight, so the caller must NOT roll the pending intent back.
     async fn pay_invoice(&self, invoice: &Bolt11Invoice) -> Result<String, PluginError> {
-        let mut req = self
+        let req = self
             .client
             .post(format!("{}/v1/channels/transactions", self.api_url))
             .json(&serde_json::json!({ "payment_request": invoice.raw }))
             .timeout(std::time::Duration::from_secs(60));
-        if let Some(mac) = &self.macaroon {
-            req = req.header("Grpc-Metadata-macaroon", mac);
-        }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| PluginError::Backend(format!("lnd pay: {e}")))?;
+        let req = match &self.macaroon {
+            Some(mac) => req.header("Grpc-Metadata-macaroon", mac),
+            None => req,
+        };
+        let resp = req.send().await.map_err(ambiguous_on_timeout("lnd pay"))?;
         let status = resp.status();
         let body: serde_json::Value = resp
             .json()
             .await
-            .map_err(|e| PluginError::Backend(format!("lnd pay json: {e}")))?;
+            .map_err(ambiguous_on_timeout("lnd pay json"))?;
         if !status.is_success() {
             return Err(PluginError::Backend(format!(
                 "lnd pay {}: {}",
@@ -380,10 +385,6 @@ impl PayoutPlugin for LightningPlugin {
         }
     }
 
-    fn threshold_sats(&self) -> u64 {
-        self.threshold_sats
-    }
-
     async fn payout_due(&self) -> Result<Vec<MinerBalance>, PluginError> {
         let balances = self.ledger.balances("lightning");
         let due: Vec<MinerBalance> = to_miner_balances(balances)
@@ -408,13 +409,16 @@ impl PayoutPlugin for LightningPlugin {
                 tracing::error!(miner = %balance.miner_id, "Ledger begin_payout failed: {e}");
                 continue;
             }
-            let outcome = async {
-                let invoice = self.fetch_invoice(&endpoint, msat).await?;
-                let hash = self.pay_invoice(&invoice).await?;
-                Ok::<String, PluginError>(hash)
-            }
-            .await;
-            match outcome {
+            // Invoice fetch happens BEFORE the payment moves: a failure
+            // here is always pre-dispatch, so it rolls back cleanly.
+            let invoice = match self.fetch_invoice(&endpoint, msat).await {
+                Ok(invoice) => invoice,
+                Err(e) => {
+                    rollback_on_definite_failure(&self.ledger, "lightning", &balance, &e);
+                    continue;
+                }
+            };
+            match self.pay_invoice(&invoice).await {
                 Ok(hash) => {
                     match self.ledger.settle_payout(
                         "lightning",
@@ -422,35 +426,19 @@ impl PayoutPlugin for LightningPlugin {
                         balance.sats,
                         &hash,
                     ) {
-                        Ok(remaining) => {
+                        Ok(_) => {
                             tracing::info!(miner = %balance.miner_id, sats = balance.sats, %hash, "LN payout");
                             paid.push(balance);
-                            let _ = remaining;
                         }
                         Err(e) => {
                             tracing::error!(miner = %balance.miner_id, "Ledger settle failed: {e}")
                         }
                     }
                 }
-                Err(e) => {
-                    // Payment did not happen — restore the balance and
-                    // record the rollback so the next pass retries cleanly.
-                    if let Err(re) =
-                        self.ledger
-                            .rollback_payout("lightning", &balance.miner_id, balance.sats)
-                    {
-                        tracing::error!(miner = %balance.miner_id, "Ledger rollback failed: {re}");
-                    }
-                    // Balance stays accrued; next pass retries.
-                    tracing::warn!(miner = %balance.miner_id, "LN payout failed, will retry: {e}");
-                }
+                Err(e) => rollback_on_definite_failure(&self.ledger, "lightning", &balance, &e),
             }
         }
         Ok(paid)
-    }
-
-    fn balances(&self) -> HashMap<String, u64> {
-        self.ledger.balances("lightning")
     }
 }
 
@@ -731,7 +719,7 @@ mod tests {
         assert_eq!(paid[0].miner_id, MINER);
         assert_eq!(paid[0].sats, SATS);
         // Balance fully drained.
-        assert!(plugin.balances().get(MINER).is_none());
+        assert!(plugin.ledger.balances("lightning").get(MINER).is_none());
 
         // Second pass with an empty ledger pays nothing — no double-pay.
         let paid2 = plugin.payout_due().await.unwrap();
@@ -758,7 +746,7 @@ mod tests {
             "amount-mismatched invoice must not be paid"
         );
         // Balance intact.
-        assert_eq!(plugin.balances().get(MINER), Some(&SATS));
+        assert_eq!(plugin.ledger.balances("lightning").get(MINER), Some(&SATS));
     }
 
     #[tokio::test]
@@ -775,7 +763,7 @@ mod tests {
 
         let paid = plugin.payout_due().await.unwrap();
         assert!(paid.is_empty());
-        assert_eq!(plugin.balances().get(MINER), Some(&SATS));
+        assert_eq!(plugin.ledger.balances("lightning").get(MINER), Some(&SATS));
     }
 
     #[tokio::test]
@@ -803,7 +791,7 @@ mod tests {
         let paid = plugin.payout_due().await.unwrap();
         assert!(paid.is_empty());
         // Balance restored for retry.
-        assert_eq!(plugin.balances().get(MINER), Some(&SATS));
+        assert_eq!(plugin.ledger.balances("lightning").get(MINER), Some(&SATS));
     }
 
     #[tokio::test]
@@ -813,7 +801,7 @@ mod tests {
         let (_server, plugin) = setup(MINER, SATS).await;
         let paid = plugin.payout_due().await.unwrap();
         assert!(paid.is_empty());
-        assert_eq!(plugin.balances().get(MINER), Some(&SATS));
+        assert_eq!(plugin.ledger.balances("lightning").get(MINER), Some(&SATS));
     }
 
     #[tokio::test]
@@ -837,7 +825,7 @@ mod tests {
 
         let paid = plugin.payout_due().await.unwrap();
         assert!(paid.is_empty(), "metadata-less response must fail closed");
-        assert_eq!(plugin.balances().get(MINER), Some(&SATS));
+        assert_eq!(plugin.ledger.balances("lightning").get(MINER), Some(&SATS));
     }
 
     #[tokio::test]
@@ -863,6 +851,6 @@ mod tests {
             paid.is_empty(),
             "invoice whose h tag does not bind to the response metadata must not be paid"
         );
-        assert_eq!(plugin.balances().get(MINER), Some(&SATS));
+        assert_eq!(plugin.ledger.balances("lightning").get(MINER), Some(&SATS));
     }
 }

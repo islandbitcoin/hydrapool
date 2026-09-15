@@ -40,7 +40,7 @@
 //! plugin stays disabled so balances accrue instead of being marked
 //! paid against an unredeemable string.
 
-use crate::payout_plugins::ledger::{Ledger, to_miner_balances};
+use crate::payout_plugins::ledger::{Ledger, rollback_on_definite_failure, to_miner_balances};
 use crate::payout_plugins::traits::{MinerBalance, PayoutPlugin, PluginContext, PluginError};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -273,10 +273,6 @@ impl PayoutPlugin for CashuPlugin {
         }
     }
 
-    fn threshold_sats(&self) -> u64 {
-        self.threshold_sats
-    }
-
     async fn payout_due(&self) -> Result<Vec<MinerBalance>, PluginError> {
         // Re-deliver minted-but-undelivered tokens first: an open
         // pending intent carrying a `minted:` payload means the token
@@ -347,8 +343,15 @@ impl PayoutPlugin for CashuPlugin {
                         &balance.miner_id,
                         &format!("minted:{token}"),
                     ) {
-                        tracing::error!(miner = %balance.miner_id, "Ledger token attach failed: {e}");
-                        continue;
+                        // The token exists and is paid for — never drop
+                        // it over a ledger-write failure. Deliver anyway
+                        // and log loudly; a lost attach only costs a
+                        // re-delivery attempt after restart, while
+                        // dropping the token loses the miner's payout.
+                        tracing::error!(
+                            miner = %balance.miner_id,
+                            "Ledger token attach failed ({e}) — delivering anyway; token is recoverable via this log on restart"
+                        );
                     }
                     match self.deliver(&balance.miner_id, &token).await {
                         Ok(()) => {
@@ -368,32 +371,24 @@ impl PayoutPlugin for CashuPlugin {
                             }
                         }
                         Err(e) => {
-                            // Token minted, attached to the open intent,
-                            // but undelivered — leave the intent OPEN;
-                            // the next pass re-delivers from the stored
+                            // Token minted (+attached, best-effort) but
+                            // undelivered — leave the intent OPEN; the
+                            // next pass re-delivers from the stored
                             // payload instead of re-minting.
                             tracing::error!(miner = %balance.miner_id, "Token minted+persisted, delivery failed — will re-deliver from ledger on next pass: {e}");
                         }
                     }
                 }
                 Err(e) => {
-                    // Mint never happened — restore the debit so the
-                    // next pass retries the full flow.
-                    if let Err(re) =
-                        self.ledger
-                            .rollback_payout("cashu", &balance.miner_id, balance.sats)
-                    {
-                        tracing::error!(miner = %balance.miner_id, "Ledger rollback failed: {re}");
-                    }
-                    tracing::warn!(miner = %balance.miner_id, "Cashu mint failed, will retry: {e}");
+                    // Mint never happened (or failed before any token
+                    // existed) — same uniform rollback semantics as the
+                    // other plugins: ambiguous outcomes leave the intent
+                    // open, definite failures restore the debit.
+                    rollback_on_definite_failure(&self.ledger, "cashu", &balance, &e);
                 }
             }
         }
         Ok(paid)
-    }
-
-    fn balances(&self) -> HashMap<String, u64> {
-        self.ledger.balances("cashu")
     }
 }
 
@@ -504,7 +499,7 @@ mod tests {
         };
         let paid = plugin.payout_due().await.unwrap();
         assert!(paid.is_empty());
-        assert_eq!(plugin.balances().get("noDest"), Some(&50_000));
+        assert_eq!(plugin.ledger.balances("cashu").get("noDest"), Some(&50_000));
     }
 
     #[tokio::test]

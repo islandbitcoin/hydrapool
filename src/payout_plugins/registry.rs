@@ -133,7 +133,6 @@ impl Default for PayoutPluginRegistry {
 mod tests {
     use super::*;
     use crate::payout_plugins::traits::{MinerBalance, PluginError};
-    use std::collections::HashMap;
 
     struct CountingPlugin {
         blocks: std::sync::atomic::AtomicUsize,
@@ -148,17 +147,11 @@ mod tests {
             self.blocks
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
-        fn threshold_sats(&self) -> u64 {
-            0
-        }
         async fn payout_due(&self) -> Result<Vec<MinerBalance>, PluginError> {
             Ok(vec![MinerBalance {
                 miner_id: "x".into(),
                 sats: 1,
             }])
-        }
-        fn balances(&self) -> HashMap<String, u64> {
-            HashMap::new()
         }
     }
 
@@ -171,14 +164,10 @@ mod tests {
         registry.register(plugin.clone());
         registry.on_block(&PluginContext {
             block_height: 900,
-            block_hash: "ab".into(),
-            block_reward_sats: 312_500_000,
             miner_payouts: vec![],
         });
         registry.on_block(&PluginContext {
             block_height: 901,
-            block_hash: "cd".into(),
-            block_reward_sats: 312_500_000,
             miner_payouts: vec![],
         });
         assert_eq!(plugin.blocks.load(std::sync::atomic::Ordering::SeqCst), 2);

@@ -15,8 +15,10 @@
 //! gateway API surface and leaves direct federation client calls to
 //! the integration pass.
 
-use crate::payout_plugins::ledger::{Ledger, to_miner_balances};
-use crate::payout_plugins::traits::{MinerBalance, PayoutPlugin, PluginContext, PluginError};
+use crate::payout_plugins::ledger::{Ledger, rollback_on_definite_failure, to_miner_balances};
+use crate::payout_plugins::traits::{
+    MinerBalance, PayoutPlugin, PluginContext, PluginError, ambiguous_on_timeout,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -82,6 +84,11 @@ impl FedimintPlugin {
     /// Create an invoice at the gateway for `sats`, then pay it from
     /// the pool's federation wallet. The gateway hands the ecash /
     /// credit to the destination op the miner registered.
+    ///
+    /// A timeout or mid-response transport failure maps to
+    /// [`PluginError::Ambiguous`]: the gateway may still have credited
+    /// the destination, so the caller must NOT roll the pending intent
+    /// back.
     async fn pay_via_gateway(&self, miner_id: &str, sats: u64) -> Result<String, PluginError> {
         let dest = self.destinations.get(miner_id).ok_or_else(|| {
             PluginError::NoDestination(format!("fedimint destination for {miner_id}"))
@@ -97,12 +104,12 @@ impl FedimintPlugin {
             .timeout(std::time::Duration::from_secs(30))
             .send()
             .await
-            .map_err(|e| PluginError::Backend(format!("fedimint gateway: {e}")))?;
+            .map_err(ambiguous_on_timeout("fedimint gateway"))?;
         let status = resp.status();
         let body: serde_json::Value = resp
             .json()
             .await
-            .map_err(|e| PluginError::Backend(format!("fedimint json: {e}")))?;
+            .map_err(ambiguous_on_timeout("fedimint json"))?;
         if !status.is_success() {
             return Err(PluginError::Backend(format!(
                 "fedimint gateway {status}: {body}"
@@ -132,10 +139,6 @@ impl PayoutPlugin for FedimintPlugin {
         }
     }
 
-    fn threshold_sats(&self) -> u64 {
-        self.threshold_sats
-    }
-
     async fn payout_due(&self) -> Result<Vec<MinerBalance>, PluginError> {
         let balances = self.ledger.balances("fedimint");
         let due: Vec<MinerBalance> = to_miner_balances(balances)
@@ -149,8 +152,10 @@ impl PayoutPlugin for FedimintPlugin {
                 continue;
             }
             // Crash-safe ordering: debit + pending intent BEFORE the
-            // gateway call; settle on success, rollback if the gateway
-            // never accepted the payment.
+            // gateway call; settle on success, rollback only if the
+            // gateway definitely never accepted the payment (an
+            // ambiguous outcome leaves the intent open for
+            // reconciliation — a rollback could double-pay).
             if let Err(e) = self
                 .ledger
                 .begin_payout("fedimint", &balance.miner_id, balance.sats)
@@ -175,22 +180,10 @@ impl PayoutPlugin for FedimintPlugin {
                         }
                     }
                 }
-                Err(e) => {
-                    if let Err(re) =
-                        self.ledger
-                            .rollback_payout("fedimint", &balance.miner_id, balance.sats)
-                    {
-                        tracing::error!(miner = %balance.miner_id, "Ledger rollback failed: {re}");
-                    }
-                    tracing::warn!(miner = %balance.miner_id, "Fedimint payout failed, will retry: {e}");
-                }
+                Err(e) => rollback_on_definite_failure(&self.ledger, "fedimint", &balance, &e),
             }
         }
         Ok(paid)
-    }
-
-    fn balances(&self) -> HashMap<String, u64> {
-        self.ledger.balances("fedimint")
     }
 }
 
@@ -306,6 +299,6 @@ mod tests {
         let plugin = plugin_with(ledger, "https://gw.invalid".into(), HashMap::new());
         let paid = plugin.payout_due().await.unwrap();
         assert!(paid.is_empty());
-        assert_eq!(plugin.balances().get(MINER), Some(&SATS));
+        assert_eq!(plugin.ledger.balances("fedimint").get(MINER), Some(&SATS));
     }
 }

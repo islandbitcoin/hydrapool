@@ -75,13 +75,13 @@ async fn main() -> ExitCode {
     let args = Args::parse();
 
     // Load configuration
-    let config = Config::load(&args.config);
-    if config.is_err() {
-        let err = config.unwrap_err();
-        error!("Failed to load config: {err}");
-        return ExitCode::FAILURE;
-    }
-    let config = config.unwrap();
+    let config = match Config::load(&args.config) {
+        Ok(config) => config,
+        Err(err) => {
+            error!("Failed to load config: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
     // Configure logging based on config
     // hold guards to keep non-blocking writers alive
     let _guards = match setup_logging(&config.logging) {
@@ -202,19 +202,19 @@ async fn main() -> ExitCode {
     let exit_sender_gbt = exit_sender.clone();
     let exit_receiver_gbt = exit_sender.subscribe();
     tokio::spawn(async move {
-        if let Err(e) = start_gbt(
+        let gbt_result = start_gbt(
             bitcoinrpc_config_cloned,
             notify_tx_for_gbt,
             GBT_POLL_INTERVAL,
             stratum_config.network,
             zmq_trigger_rx,
         )
-        .await
+        .await;
+        if let Err(e) = gbt_result
+            && *exit_receiver_gbt.borrow() == ShutdownReason::None
         {
-            if *exit_receiver_gbt.borrow() == ShutdownReason::None {
-                tracing::error!("Failed to fetch block template. Shutting down. \n {e}");
-                let _ = exit_sender_gbt.send(ShutdownReason::Error);
-            }
+            tracing::error!("Failed to fetch block template. Shutting down. \n {e}");
+            let _ = exit_sender_gbt.send(ShutdownReason::Error);
         }
     });
 
@@ -304,8 +304,10 @@ async fn main() -> ExitCode {
                 template_rx,
             )
             .await;
-        if result.is_err() && *exit_receiver_stratum.borrow() == ShutdownReason::None {
-            error!("Failed to start Stratum server: {}", result.unwrap_err());
+        if let Err(e) = result
+            && *exit_receiver_stratum.borrow() == ShutdownReason::None
+        {
+            error!("Failed to start Stratum server: {e}");
             let _ = exit_sender_stratum.send(ShutdownReason::Error);
         }
         info!("Stratum server stopped");
@@ -314,6 +316,7 @@ async fn main() -> ExitCode {
     let (monitoring_event_sender, _monitoring_event_receiver) =
         p2poolv2_lib::monitoring_events::create_monitoring_event_channel();
 
+    let pool_signature_for_api = stratum_config.pool_signature.clone();
     let (node_handle, stopping_rx) = match NodeHandle::new(
         config.clone(),
         chain_store_handle.clone(),
@@ -342,7 +345,7 @@ async fn main() -> ExitCode {
         node_handle.clone(),
         monitoring_event_sender,
         stratum_config.network,
-        stratum_config.pool_signature,
+        pool_signature_for_api,
     )
     .await
     {
@@ -377,13 +380,19 @@ async fn main() -> ExitCode {
                         .await;
                 }
             });
-            // Wire block-found events into the plugins. The ZMQ
-            // hashblock subscription fires exactly once per bitcoin
-            // block found by the pool; each trigger distributes the
-            // block's actual coinbase value over the PPLNS window using
-            // the same difficulty threshold the coinbase builder used
-            // (network difficulty of the mined template's bits times
-            // the configured difficulty multiplier). Accruing per
+            // Wire block-found events into the plugins. bitcoind's
+            // zmqpubhashblock fires for EVERY block accepted by the
+            // network, so the raw block hash is kept (the lib's
+            // ZmqListener discards it), the block is fetched over RPC,
+            // and accrual is gated on the block actually being one of
+            // ours: its coinbase ends with the pool signature and its
+            // outputs sum to the template's coinbase value. Each
+            // pool-found block then distributes the miner-attributable
+            // coinbase (coinbasevalue minus donation/fee cuts, the same
+            // cuts the coinbase builder applied) over the PPLNS window
+            // using the same difficulty threshold the coinbase builder
+            // used (network difficulty of the mined template's bits
+            // times the configured difficulty multiplier). Accruing per
             // confirmed share would instead credit a full subsidy ~60
             // times per bitcoin block and drain the pool's LN node.
             let block_registry = payout_loop_registry;
@@ -391,7 +400,28 @@ async fn main() -> ExitCode {
             let difficulty_multiplier_for_payouts = stratum_config.difficulty_multiplier as u128;
             let payout_window = plugin_pplns_window;
             let chain_store_for_payouts = chain_store_handle;
-            let zmq_rx_for_payouts = match ZmqListener.start(&stratum_config.zmqpubhashblock) {
+            let rpc_for_payouts = match bitcoindrpc::BitcoindRpcClient::new(
+                &config.bitcoinrpc.url,
+                &config.bitcoinrpc.username,
+                &config.bitcoinrpc.password,
+            ) {
+                Ok(client) => client,
+                Err(e) => {
+                    error!("Failed to create bitcoind RPC client for payout plugins: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let pool_signature_for_payouts = stratum_config
+                .pool_signature
+                .clone()
+                .map(String::into_bytes);
+            let donation_for_payouts = stratum_config.donation;
+            let donation_address_for_payouts = stratum_config.donation_address_parsed.clone();
+            let fee_for_payouts = stratum_config.fee;
+            let fee_address_for_payouts = stratum_config.fee_address_parsed.clone();
+            let zmq_rx_for_payouts = match payout_plugins::block_found::start_hashblock_listener(
+                &stratum_config.zmqpubhashblock,
+            ) {
                 Ok(rx) => rx,
                 Err(e) => {
                     error!("Failed to set up ZMQ listener for payout plugins: {e}");
@@ -401,61 +431,104 @@ async fn main() -> ExitCode {
             tokio::spawn(async move {
                 let mut zmq_rx = zmq_rx_for_payouts;
                 let mut latest_template_rx = latest_template_rx;
-                // Dedup guard: the same template must never accrue
-                // twice (a ZMQ retry or duplicate relay).
-                let mut last_accrued: Option<u64> = None;
-                loop {
-                    match zmq_rx.recv().await {
-                        Some(()) => {
-                            let Some(template) = latest_template_rx.borrow_and_update().clone()
-                            else {
-                                warn!(
-                                    "Block found before any block template known — skipping plugin accrual for this block"
-                                );
-                                continue;
-                            };
-                            // The template miners were working on is the
-                            // block that was just found: its coinbase
-                            // value and bits are what the found block's
-                            // coinbase was built from.
-                            let fingerprint = template.height as u64
-                                ^ hex_prefix_u64(&template.previousblockhash.to_string());
-                            if last_accrued == Some(fingerprint) {
-                                debug_log_duplicate(&template);
-                                continue;
-                            }
-                            let Ok(compact) =
-                                bitcoin::pow::CompactTarget::from_unprefixed_hex(&template.bits)
-                            else {
-                                error!(
-                                    "Payout plugins: template bits '{}' unparseable — skipping accrual",
-                                    template.bits
-                                );
-                                continue;
-                            };
-                            let total_difficulty = bitcoin::Target::from_compact(compact)
-                                .difficulty(network_for_payouts)
-                                .saturating_mul(difficulty_multiplier_for_payouts);
-                            let miner_payouts = plugin_distribution_from_window(
-                                &payout_window,
-                                &chain_store_for_payouts,
-                                total_difficulty,
-                                template.coinbasevalue,
+                // Recent templates and recently-accrued block hashes:
+                // the template history absorbs the race where gbt
+                // publishes a new template before the accrual task sees
+                // the block mined from the previous one; the hash ring
+                // dedups duplicate zmq notifications for one block.
+                let mut recent_templates = std::collections::VecDeque::new();
+                let mut accrued_blocks = std::collections::VecDeque::new();
+                while let Some(hash_bytes) = zmq_rx.recv().await {
+                    // Take any newer template the notifier published —
+                    // but keep the old ones, the found block may have
+                    // been mined from any of them.
+                    while latest_template_rx.has_changed().unwrap_or(false) {
+                        if let Some(t) = latest_template_rx.borrow_and_update().clone() {
+                            payout_plugins::block_found::remember_template(
+                                &mut recent_templates,
+                                t,
                             );
-                            let ctx = payout_plugins::PluginContext {
-                                block_height: template.height,
-                                block_hash: template.previousblockhash.to_string(),
-                                block_reward_sats: template.coinbasevalue,
-                                miner_payouts,
-                            };
-                            block_registry.on_block(&ctx);
-                            last_accrued = Some(fingerprint);
                         }
-                        None => return, // ZMQ listener channel closed
                     }
+                    if recent_templates.is_empty() {
+                        warn!(
+                            "Block announced before any block template known — skipping plugin accrual"
+                        );
+                        continue;
+                    }
+                    let Some(block) = payout_plugins::block_found::fetch_block_by_hash(
+                        &rpc_for_payouts,
+                        &hash_bytes,
+                    )
+                    .await
+                    else {
+                        // Not fetchable (pruned, lagging node) — skip;
+                        // accrual only ever happens on a verified block.
+                        continue;
+                    };
+                    let block_hash = block.header.block_hash();
+                    if !payout_plugins::block_found::accrue_once(&mut accrued_blocks, block_hash) {
+                        continue;
+                    }
+                    let matched = recent_templates.iter().rev().find(|template| {
+                        payout_plugins::block_found::is_pool_block(
+                            &block,
+                            template,
+                            pool_signature_for_payouts.as_deref(),
+                        )
+                    });
+                    let Some(template) = matched else {
+                        trace!(
+                            height = block.header.block_hash().to_string().as_str(),
+                            "Network block is not a pool block — no plugin accrual"
+                        );
+                        continue;
+                    };
+                    // The found block's coinbase was built from this
+                    // template: its outputs already carry the donation
+                    // and fee cuts, so accrue only the miner share.
+                    let reward_sats = payout_plugins::block_found::miner_attributable_sats(
+                        template.coinbasevalue,
+                        donation_for_payouts,
+                        donation_address_for_payouts.as_ref(),
+                        fee_for_payouts,
+                        fee_address_for_payouts.as_ref(),
+                    );
+                    if reward_sats == 0 {
+                        continue; // 100% donation/fee — miners accrue nothing
+                    }
+                    let Ok(compact) =
+                        bitcoin::pow::CompactTarget::from_unprefixed_hex(&template.bits)
+                    else {
+                        error!(
+                            "Payout plugins: template bits '{}' unparseable — skipping accrual",
+                            template.bits
+                        );
+                        continue;
+                    };
+                    let total_difficulty = bitcoin::Target::from_compact(compact)
+                        .difficulty(network_for_payouts)
+                        .saturating_mul(difficulty_multiplier_for_payouts);
+                    let miner_payouts = plugin_distribution_from_window(
+                        &payout_window,
+                        &chain_store_for_payouts,
+                        total_difficulty,
+                        reward_sats,
+                    );
+                    let ctx = payout_plugins::PluginContext {
+                        block_height: template.height,
+                        miner_payouts,
+                    };
+                    block_registry.on_block(&ctx);
+                    info!(
+                        height = template.height,
+                        block_hash = %block_hash,
+                        reward_sats,
+                        "Pool block found — plugin accrual complete"
+                    );
                 }
             });
-            info!("Payout plugins active (block-found accrual via zmqpubhashblock)");
+            info!("Payout plugins active (pool-block-gated accrual via zmqpubhashblock)");
         }
         Ok(_) => info!("No payout plugins configured"),
         // A ledger open failure with payout plugins configured is a
@@ -538,18 +611,20 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Per-miner sats for one found bitcoin block, taken from the PPLNS
-/// window at the same threshold the coinbase builder used.
+/// Per-miner sats for one pool-found bitcoin block, taken from the
+/// PPLNS window at the same threshold the coinbase builder used.
 ///
 /// `total_difficulty` must be the block's network difficulty times the
 /// configured difficulty multiplier (exactly what
 /// `build_output_distribution` in the notify worker passes to
-/// `get_output_distribution`), and `reward_sats` the block's actual
-/// coinbase value — so the plugin accrual for one block equals the
-/// miner-attributable coinbase outputs, once per block, not once per
-/// share. Each miner's proportional slice is computed the same way the
-/// coinbase `append_proportional_distribution` does: difficulty-weighted,
-/// deterministic remainder assignment.
+/// `get_output_distribution`), and `reward_sats` the block's
+/// miner-attributable coinbase (coinbasevalue after the donation/fee
+/// cuts, see `block_found::miner_attributable_sats`) — so the plugin
+/// accrual for one block equals the miner-attributable coinbase
+/// outputs, once per pool block, not once per share or once per
+/// network block. Each miner's proportional slice is computed the same
+/// way the coinbase `append_proportional_distribution` does:
+/// difficulty-weighted, deterministic remainder assignment.
 fn plugin_distribution_from_window(
     payout_window: &std::sync::Arc<
         std::sync::RwLock<p2poolv2_lib::accounting::payout::sharechain_pplns::PplnsWindow>,
@@ -611,24 +686,6 @@ fn proportional_split(
         }
     }
     payouts
-}
-
-/// Fold a hex string's first 8 bytes into a u64 fingerprint for the
-/// duplicate-accrual guard.
-fn hex_prefix_u64(hex_str: &str) -> u64 {
-    let bytes = hex::decode(&hex_str[..hex_str.len().min(16)]).unwrap_or_default();
-    let mut v: u64 = 0;
-    for b in bytes.iter().take(8) {
-        v = (v << 8) | *b as u64;
-    }
-    v
-}
-
-fn debug_log_duplicate(template: &p2poolv2_lib::stratum::work::block_template::BlockTemplate) {
-    info!(
-        height = template.height,
-        "Duplicate block-found trigger for an already-accrued template — skipping"
-    );
 }
 
 #[cfg(test)]
@@ -756,16 +813,5 @@ mod tests {
             first.iter().any(|(_, sats)| *sats == 34),
             "the 1-sat remainder must land somewhere exactly"
         );
-    }
-
-    #[test]
-    fn hex_prefix_u64_is_stable_and_ordered() {
-        let a = hex_prefix_u64("0102030405060708ffff");
-        let b = hex_prefix_u64("0102030405060708");
-        let c = hex_prefix_u64("ff02030405060708");
-        assert_eq!(a, b);
-        assert_ne!(a, c);
-        // Big-endian fold: the first byte is the most significant.
-        assert_eq!(hex_prefix_u64("0100000000000000"), 0x01u64 << 56);
     }
 }
