@@ -33,6 +33,7 @@ use p2poolv2_lib::stratum::work::gbt::start_gbt;
 use p2poolv2_lib::stratum::work::notify::start_notify;
 use p2poolv2_lib::stratum::work::tracker::start_tracker_actor;
 use p2poolv2_lib::stratum::zmq_listener::{ZmqListener, ZmqListenerTrait};
+use std::collections::HashMap;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -158,10 +159,36 @@ async fn main() -> ExitCode {
     let bitcoinrpc_config = config.bitcoinrpc.clone();
 
     let (stratum_shutdown_tx, stratum_shutdown_rx) = tokio::sync::oneshot::channel();
+    // Template tap: every NotifyCmd::SendToAll from gbt carries the
+    // block template the miners are being told to work on. The tap
+    // records the latest template (the payout plugins distribute the
+    // coinbase of the block actually mined from it) and forwards the
+    // command to the notifier unchanged.
+    let (notify_tx_in, notify_tap_rx) = tokio::sync::mpsc::channel(NOTIFY_CHANNEL_CAPACITY);
     let (notify_tx, notify_rx) = tokio::sync::mpsc::channel(NOTIFY_CHANNEL_CAPACITY);
+    let (latest_template_tx, latest_template_rx) = tokio::sync::watch::channel(
+        None::<std::sync::Arc<p2poolv2_lib::stratum::work::block_template::BlockTemplate>>,
+    );
+    {
+        let latest_template_tx = latest_template_tx.clone();
+        tokio::spawn(async move {
+            let mut tap_rx = notify_tap_rx;
+            while let Some(cmd) = tap_rx.recv().await {
+                if let p2poolv2_lib::stratum::work::notify::NotifyCmd::SendToAll { template } = &cmd
+                {
+                    let _ = latest_template_tx.send(Some(std::sync::Arc::clone(template)));
+                }
+                // The notifier task shutting down its receiver ends the
+                // tap; nothing else consumes the stream.
+                if notify_tx.send(cmd).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
     let tracker_handle = start_tracker_actor();
 
-    let notify_tx_for_gbt = notify_tx.clone();
+    let notify_tx_for_gbt = notify_tx_in.clone();
     let bitcoinrpc_config_cloned = bitcoinrpc_config.clone();
     // Setup ZMQ publisher for block notifications
     let zmq_trigger_rx = match ZmqListener.start(&stratum_config.zmqpubhashblock) {
@@ -240,7 +267,7 @@ async fn main() -> ExitCode {
     let stats_dir_for_shutdown = config.logging.stats_dir.clone();
     let chain_store_handle_for_stratum = chain_store_handle.clone();
     let tracker_handle_cloned = tracker_handle.clone();
-    let notify_tx_for_node = notify_tx.clone();
+    let notify_tx_for_node = notify_tx_in.clone();
     let exit_sender_stratum = exit_sender.clone();
     let exit_receiver_stratum = exit_sender.subscribe();
 
@@ -270,7 +297,7 @@ async fn main() -> ExitCode {
         let result = stratum_server
             .start(
                 None,
-                notify_tx,
+                notify_tx_in,
                 tracker_handle_cloned,
                 bitcoinrpc_config,
                 metrics_cloned,
@@ -286,9 +313,6 @@ async fn main() -> ExitCode {
 
     let (monitoring_event_sender, _monitoring_event_receiver) =
         p2poolv2_lib::monitoring_events::create_monitoring_event_channel();
-    // Receiver for the payout plugins, subscribed before the sender is
-    // moved into the API server.
-    let plugin_event_rx = monitoring_event_sender.subscribe();
 
     let (node_handle, stopping_rx) = match NodeHandle::new(
         config.clone(),
@@ -353,41 +377,85 @@ async fn main() -> ExitCode {
                         .await;
                 }
             });
-            // Wire confirmed share events into the plugins: every
-            // MonitoringEvent::Share emitted by the organise worker
-            // (post-promotion of a confirmed share) becomes a
-            // PluginContext with the per-miner distribution taken from
-            // the PPLNS window at that share's difficulty.
+            // Wire block-found events into the plugins. The ZMQ
+            // hashblock subscription fires exactly once per bitcoin
+            // block found by the pool; each trigger distributes the
+            // block's actual coinbase value over the PPLNS window using
+            // the same difficulty threshold the coinbase builder used
+            // (network difficulty of the mined template's bits times
+            // the configured difficulty multiplier). Accruing per
+            // confirmed share would instead credit a full subsidy ~60
+            // times per bitcoin block and drain the pool's LN node.
             let block_registry = payout_loop_registry;
             let network_for_payouts = stratum_config.network;
+            let difficulty_multiplier_for_payouts = stratum_config.difficulty_multiplier as u128;
             let payout_window = plugin_pplns_window;
+            let chain_store_for_payouts = chain_store_handle;
+            let zmq_rx_for_payouts = match ZmqListener.start(&stratum_config.zmqpubhashblock) {
+                Ok(rx) => rx,
+                Err(e) => {
+                    error!("Failed to set up ZMQ listener for payout plugins: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
             tokio::spawn(async move {
-                let mut event_rx = plugin_event_rx;
+                let mut zmq_rx = zmq_rx_for_payouts;
+                let mut latest_template_rx = latest_template_rx;
+                // Dedup guard: the same template must never accrue
+                // twice (a ZMQ retry or duplicate relay).
+                let mut last_accrued: Option<u64> = None;
                 loop {
-                    match event_rx.recv().await {
-                        Ok(p2poolv2_lib::monitoring_events::MonitoringEvent::Share(share)) => {
+                    match zmq_rx.recv().await {
+                        Some(()) => {
+                            let Some(template) = latest_template_rx.borrow_and_update().clone()
+                            else {
+                                warn!(
+                                    "Block found before any block template known — skipping plugin accrual for this block"
+                                );
+                                continue;
+                            };
+                            // The template miners were working on is the
+                            // block that was just found: its coinbase
+                            // value and bits are what the found block's
+                            // coinbase was built from.
+                            let fingerprint = template.height as u64
+                                ^ hex_prefix_u64(&template.previousblockhash.to_string());
+                            if last_accrued == Some(fingerprint) {
+                                debug_log_duplicate(&template);
+                                continue;
+                            }
+                            let Ok(compact) =
+                                bitcoin::pow::CompactTarget::from_unprefixed_hex(&template.bits)
+                            else {
+                                error!(
+                                    "Payout plugins: template bits '{}' unparseable — skipping accrual",
+                                    template.bits
+                                );
+                                continue;
+                            };
+                            let total_difficulty = bitcoin::Target::from_compact(compact)
+                                .difficulty(network_for_payouts)
+                                .saturating_mul(difficulty_multiplier_for_payouts);
                             let miner_payouts = plugin_distribution_from_window(
-                                &share,
                                 &payout_window,
-                                network_for_payouts,
+                                &chain_store_for_payouts,
+                                total_difficulty,
+                                template.coinbasevalue,
                             );
                             let ctx = payout_plugins::PluginContext {
-                                block_height: share.height,
-                                block_hash: share.blockhash.to_string(),
-                                block_reward_sats: plugin_block_reward_sats(share.height),
+                                block_height: template.height,
+                                block_hash: template.previousblockhash.to_string(),
+                                block_reward_sats: template.coinbasevalue,
                                 miner_payouts,
                             };
                             block_registry.on_block(&ctx);
+                            last_accrued = Some(fingerprint);
                         }
-                        Ok(_) => {}
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            warn!("Payout plugin event stream lagged, skipped {n} events");
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                        None => return, // ZMQ listener channel closed
                     }
                 }
             });
-            info!("Payout plugins active");
+            info!("Payout plugins active (block-found accrual via zmqpubhashblock)");
         }
         Ok(_) => info!("No payout plugins configured"),
         // A ledger open failure with payout plugins configured is a
@@ -470,53 +538,58 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Bitcoin block subsidy in sats for `height` (50 BTC halving
-/// schedule). The pool's out-of-band plugin payouts mirror the
-/// on-chain coinbase subsidy; fees accrue to the block finder.
-fn plugin_block_reward_sats(height: u32) -> u64 {
-    const HALVING_INTERVAL: u64 = 210_000;
-    const INITIAL_SUBSIDY_SATS: u64 = 5_000_000_000;
-    let halvings = (height as u64) / HALVING_INTERVAL;
-    if halvings >= 64 {
-        0
-    } else {
-        INITIAL_SUBSIDY_SATS >> halvings
-    }
-}
-
-/// Per-miner sats for one confirmed share, taken from the PPLNS
-/// window's difficulty distribution at the time of confirmation.
+/// Per-miner sats for one found bitcoin block, taken from the PPLNS
+/// window at the same threshold the coinbase builder used.
 ///
-/// The share's own difficulty determines the window slice
-/// (`get_distribution` walks entries up to that cumulative difficulty),
-/// and each miner's proportional slice of the subsidy is computed the
-/// same way the coinbase `append_proportional_distribution` does:
-/// difficulty-weighted, deterministic remainder assignment.
+/// `total_difficulty` must be the block's network difficulty times the
+/// configured difficulty multiplier (exactly what
+/// `build_output_distribution` in the notify worker passes to
+/// `get_output_distribution`), and `reward_sats` the block's actual
+/// coinbase value — so the plugin accrual for one block equals the
+/// miner-attributable coinbase outputs, once per block, not once per
+/// share. Each miner's proportional slice is computed the same way the
+/// coinbase `append_proportional_distribution` does: difficulty-weighted,
+/// deterministic remainder assignment.
 fn plugin_distribution_from_window(
-    share: &p2poolv2_lib::store::dag_store::ShareInfo,
     payout_window: &std::sync::Arc<
         std::sync::RwLock<p2poolv2_lib::accounting::payout::sharechain_pplns::PplnsWindow>,
     >,
-    network: bitcoin::Network,
+    chain_store_handle: &p2poolv2_lib::shares::chain::chain_store_handle::ChainStoreHandle,
+    total_difficulty: u128,
+    reward_sats: u64,
 ) -> Vec<payout_plugins::MinerBalance> {
-    // The confirmed share's own difficulty is the PPLNS threshold for
-    // this distribution.
-    let share_difficulty = bitcoin::Target::from_compact(share.bits).difficulty(network);
-
+    if total_difficulty == 0 {
+        return Vec::new();
+    }
     let Ok(mut window) = payout_window.write() else {
         error!("PPLNS window lock poisoned — skipping plugin accrual");
         return Vec::new();
     };
-    let distribution = window.get_distribution(share_difficulty);
-    drop(window);
-
-    let total_difficulty: u128 = distribution.values().sum();
-    if total_difficulty == 0 {
+    // Pull newly confirmed shares into the window cache before
+    // walking it (same contract as Payout::fill_distribution_from_shares).
+    if let Err(e) = window.update(chain_store_handle) {
+        error!("PPLNS window update failed — skipping plugin accrual: {e}");
         return Vec::new();
     }
-    let reward = plugin_block_reward_sats(share.height);
-    // Deterministic proportional split, remainder to the
-    // lexicographically-last address (matches the coinbase builder).
+    let distribution = window.get_distribution(total_difficulty);
+    drop(window);
+
+    proportional_split(&distribution, reward_sats)
+}
+
+/// Deterministic difficulty-weighted split of `reward_sats` across the
+/// distribution's addresses, remainder to the lexicographically-last
+/// address (matches the coinbase `append_proportional_distribution`).
+/// The returned sats always sum to exactly `reward_sats` (when the
+/// distribution is non-empty) — one block, one reward.
+fn proportional_split(
+    distribution: &HashMap<bitcoin::Address, u128>,
+    reward_sats: u64,
+) -> Vec<payout_plugins::MinerBalance> {
+    let window_total: u128 = distribution.values().sum();
+    if window_total == 0 {
+        return Vec::new();
+    }
     let mut entries: Vec<(&bitcoin::Address, &u128)> = distribution.iter().collect();
     entries.sort_by_key(|(a, _)| a.to_string());
     let mut allocated: u64 = 0;
@@ -524,9 +597,9 @@ fn plugin_distribution_from_window(
     let mut payouts = Vec::with_capacity(count);
     for (index, (address, difficulty)) in entries.into_iter().enumerate() {
         let sats = if index == count - 1 {
-            reward.saturating_sub(allocated)
+            reward_sats.saturating_sub(allocated)
         } else {
-            let s = ((reward as u128 * difficulty) / total_difficulty) as u64;
+            let s = ((reward_sats as u128 * difficulty) / window_total) as u64;
             allocated = allocated.saturating_add(s);
             s
         };
@@ -538,4 +611,161 @@ fn plugin_distribution_from_window(
         }
     }
     payouts
+}
+
+/// Fold a hex string's first 8 bytes into a u64 fingerprint for the
+/// duplicate-accrual guard.
+fn hex_prefix_u64(hex_str: &str) -> u64 {
+    let bytes = hex::decode(&hex_str[..hex_str.len().min(16)]).unwrap_or_default();
+    let mut v: u64 = 0;
+    for b in bytes.iter().take(8) {
+        v = (v << 8) | *b as u64;
+    }
+    v
+}
+
+fn debug_log_duplicate(template: &p2poolv2_lib::stratum::work::block_template::BlockTemplate) {
+    info!(
+        height = template.height,
+        "Duplicate block-found trigger for an already-accrued template — skipping"
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// The accrual for one block interval must equal the block reward
+    /// exactly once — regardless of how many confirmed shares the
+    /// window holds. Regression guard for the per-share over-credit
+    /// bug (each confirmed share used to credit a full subsidy).
+    #[test]
+    fn distribution_sums_to_block_reward_once() {
+        use bitcoin::CompressedPublicKey;
+        use bitcoin::hashes::{Hash, sha256d};
+        let network = bitcoin::Network::Signet;
+        let addr = |pubkey_hex: &str| -> String {
+            let pubkey: CompressedPublicKey = pubkey_hex.parse().unwrap();
+            bitcoin::Address::p2wpkh(&pubkey, network).to_string()
+        };
+        let miner_a = addr("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798");
+        let miner_b = addr("02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5");
+        // Simulate a block interval of ~60 confirmed shares alternating
+        // between two miners of equal difficulty.
+        let mut window =
+            p2poolv2_lib::accounting::payout::sharechain_pplns::PplnsWindow::new(network);
+        let shares: Vec<_> = (0..60u64)
+            .map(|i| {
+                (
+                    bitcoin::BlockHash::from_raw_hash(sha256d::Hash::from_byte_array([
+                        (i % 256) as u8,
+                        0x11,
+                        0x22,
+                        0x33,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ])),
+                    if i % 2 == 0 {
+                        miner_a.clone()
+                    } else {
+                        miner_b.clone()
+                    },
+                    100u128,
+                    vec![],
+                )
+            })
+            .collect();
+        window.populate_for_benchmark(shares);
+
+        const REWARD: u64 = 3_125_000_000;
+        // Threshold = whole window, exactly what a block's
+        // network_difficulty * multiplier slice consumes.
+        let distribution = window.get_distribution(u128::MAX);
+        let payouts = proportional_split(&distribution, REWARD);
+        let total: u64 = payouts.iter().map(|p| p.sats).sum();
+        assert_eq!(
+            total, REWARD,
+            "one block interval must accrue exactly one block reward, not one reward per share"
+        );
+        assert_eq!(payouts.len(), 2);
+        for p in &payouts {
+            assert_eq!(p.sats, REWARD / 2, "equal difficulty splits evenly");
+        }
+    }
+
+    /// The split is deterministic: same distribution, same result, and
+    /// the remainder from integer truncation always lands on the same
+    /// (lexicographically-last) address.
+    #[test]
+    fn proportional_split_remainder_is_deterministic() {
+        let mk = |s: &str| -> bitcoin::Address {
+            s.parse::<bitcoin::Address<_>>().unwrap().assume_checked()
+        };
+        let a = mk("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq");
+        let b = mk("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4");
+        let c = mk("bc1q34aq5drpuwy3wgl9lhup9892qp6svr8ldzyy7c");
+        // 3 addresses splitting 100 sats that cannot divide evenly:
+        // 33 + 33 + 34.
+        let distribution = HashMap::from([(a, 1u128), (b, 1u128), (c, 1u128)]);
+        let mut first: Vec<(String, u64)> = proportional_split(&distribution, 100)
+            .into_iter()
+            .map(|p| (p.miner_id, p.sats))
+            .collect();
+        first.sort();
+        for _ in 0..10 {
+            let mut again: Vec<(String, u64)> = proportional_split(&distribution, 100)
+                .into_iter()
+                .map(|p| (p.miner_id, p.sats))
+                .collect();
+            again.sort();
+            assert_eq!(again, first, "split must be deterministic");
+        }
+        assert_eq!(
+            first.iter().map(|(_, sats)| sats).sum::<u64>(),
+            100,
+            "remainder must not be lost"
+        );
+        assert!(
+            first.iter().any(|(_, sats)| *sats == 34),
+            "the 1-sat remainder must land somewhere exactly"
+        );
+    }
+
+    #[test]
+    fn hex_prefix_u64_is_stable_and_ordered() {
+        let a = hex_prefix_u64("0102030405060708ffff");
+        let b = hex_prefix_u64("0102030405060708");
+        let c = hex_prefix_u64("ff02030405060708");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        // Big-endian fold: the first byte is the most significant.
+        assert_eq!(hex_prefix_u64("0100000000000000"), 0x01u64 << 56);
+    }
 }

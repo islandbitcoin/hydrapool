@@ -19,8 +19,11 @@
 //!
 //! Invoices returned by the endpoint are validated before payment: the
 //! BOLT11 must decode, its amount must equal the requested amount, and
-//! it must carry a description hash (the LNURL-pay spec's `h` tag) so
-//! the payee cannot substitute an arbitrary invoice after the fact.
+//! its description hash must equal SHA-256 of the LNURL response's
+//! `metadata` field (the LNURL-pay spec's h-tag binding, LUD-06). A
+//! response without `metadata` fails closed — the pool would otherwise
+//! have no way to tell the invoice the payee actually authorized from
+//! a substituted one.
 
 use crate::payout_plugins::ledger::{Ledger, to_miner_balances};
 use crate::payout_plugins::traits::{MinerBalance, PayoutPlugin, PluginContext, PluginError};
@@ -116,7 +119,8 @@ impl LightningPlugin {
             .json()
             .await
             .map_err(|e| PluginError::Backend(format!("lnurl json: {e}")))?;
-        // LNURL-pay response: {pr: "<bolt11>", status: "OK"}
+        // LNURL-pay response: {pr: "<bolt11>", status: "OK", metadata:
+        // "<json array string>"}
         if body.get("status").and_then(|s| s.as_str()) != Some("OK") {
             return Err(PluginError::Backend(format!("lnurl error: {body}")));
         }
@@ -124,6 +128,25 @@ impl LightningPlugin {
             .get("pr")
             .and_then(|p| p.as_str())
             .ok_or_else(|| PluginError::Backend("lnurl response missing pr".into()))?;
+        // LNURL-pay (LUD-06) requires `metadata` — the payee metadata
+        // JSON the wallet shows the payer — and mandates that the
+        // invoice's h tag (description hash) equals SHA-256 of the
+        // metadata string. Enforce that binding here so the invoice we
+        // pay is provably the one the payee authorized, not an
+        // arbitrary substituted invoice that merely carries some h tag.
+        let metadata = body
+            .get("metadata")
+            .and_then(|m| m.as_str())
+            .ok_or_else(|| {
+                PluginError::Backend(
+                    "lnurl response missing metadata — cannot verify invoice description hash, refusing to pay"
+                        .into(),
+                )
+            })?;
+        let expected_description_hash = {
+            use bitcoin::hashes::Hash;
+            hex::encode(bitcoin::hashes::sha256::Hash::hash(metadata.as_bytes()).to_byte_array())
+        };
         // Never trust the returned invoice: decode it and check the
         // amount matches what we asked for before paying it.
         let invoice = decode_bolt11(pr).ok_or_else(|| {
@@ -135,10 +158,18 @@ impl LightningPlugin {
                 invoice.amount_msat, amount_msat
             )));
         }
-        if invoice.description_hash.is_none() {
-            return Err(PluginError::Backend(
-                "lnurl invoice missing description hash (h tag) — refusing to pay".into(),
-            ));
+        match &invoice.description_hash {
+            None => {
+                return Err(PluginError::Backend(
+                    "lnurl invoice missing description hash (h tag) — refusing to pay".into(),
+                ));
+            }
+            Some(h) if h != &expected_description_hash => {
+                return Err(PluginError::Backend(format!(
+                    "lnurl invoice description hash {h} != sha256(metadata) {expected_description_hash} — refusing to pay"
+                )));
+            }
+            Some(_) => {}
         }
         Ok(invoice)
     }
@@ -510,21 +541,34 @@ mod tests {
 
     #[test]
     fn decode_bolt11_extracts_amount_and_description_hash() {
-        // A real-shaped testnet invoice, amount 50 mBTC (5_000_000 msat),
-        // h tag = sha256 of "One piece of chocolate cake" (the BOLT 11
-        // spec's canonical test vector description).
-        let inv = "lntb50m1psgvuyvdyp2x4hnerak4r2k4jrvxyj9ws3rsz8cywangr2d9nhm4sh32s456rjsdqqcqzzsxqyz5vqsp5w7zc2zyztpnlyxu7lhzpw vapfzs5nmw8s3pvcjm7y5awpu3wmqjq9qyyssq6fd3xsjylr2c7xcjkuqklema2mc4whnzperzzn3fzpwrpppxwaqujyn6zc0nvwsnzw66d6lrc2s7zthrpzpjhynh9zcjlufzqjkmlgpcqfzh3m".replace(' ', "");
+        // Generated with the same helper the payout tests use, so this
+        // asserts unconditionally: a decode regression (including the
+        // decoder returning None) fails the test instead of passing
+        // vacuously through an `if let`.
+        const DESC_HASH: &str = "0102030405060708090a0b0c0d0e0f1011121314151617181a1b1c1d1e1f2021";
+        let inv = test_invoice("50m", DESC_HASH);
         let decoded = decode_bolt11(&inv);
-        // If this hand-built vector fails to decode, the structural
-        // assertion below still holds on a generated invoice.
-        if let Some(d) = decoded {
-            assert_eq!(d.amount_msat, 50 * 100_000_000);
-            assert!(d.description_hash.is_some());
-            assert_eq!(
-                d.raw,
-                inv.strip_prefix("lntb").map(|_| inv.as_str()).unwrap()
-            );
-        }
+        assert!(
+            decoded.is_some(),
+            "decoder must decode the test_invoice output: {inv}"
+        );
+        let d = decoded.unwrap();
+        assert_eq!(d.amount_msat, 50 * 100_000_000);
+        assert_eq!(
+            d.description_hash.as_deref(),
+            Some(DESC_HASH),
+            "decoder must extract the h tag payload"
+        );
+        assert_eq!(d.raw, inv);
+    }
+
+    #[test]
+    fn decode_bolt11_accepts_lightning_prefix() {
+        const DESC_HASH: &str = "0102030405060708090a0b0c0d0e0f1011121314151617181a1b1c1d1e1f2021";
+        let inv = test_invoice("1m", DESC_HASH);
+        let decoded = decode_bolt11(&format!("lightning:{inv}"));
+        assert!(decoded.is_some(), "lightning: prefix must be stripped");
+        assert_eq!(decoded.unwrap().amount_msat, 100_000_000);
     }
 
     #[test]
@@ -547,7 +591,23 @@ mod tests {
 
     // --- payout_due flow tests against a mock LNURL-pay endpoint ---
 
-    const LNURL_RESPONSE_OK: &str = r#"{"status":"OK","pr":"INVOICE_PLACEHOLDER"}"#;
+    const LNURL_METADATA: &str = r#"[["text/plain","payout to miner"]]"#;
+
+    /// LNURL-pay response body with the metadata field the h-tag check
+    /// verifies against, and `INVOICE_PLACEHOLDER` swapped by callers.
+    fn lnurl_response_ok(invoice: &str) -> String {
+        serde_json::json!({
+            "status": "OK",
+            "pr": invoice,
+            "metadata": LNURL_METADATA,
+        })
+        .to_string()
+    }
+
+    fn sha256_hex(s: &str) -> String {
+        use bitcoin::hashes::Hash;
+        hex::encode(bitcoin::hashes::sha256::Hash::hash(s.as_bytes()).to_byte_array())
+    }
 
     /// Build a plugin pointed at the mock server, with a funded ledger
     /// balance for `miner`.
@@ -647,11 +707,9 @@ mod tests {
         const MINER: &str = "happy";
         const SATS: u64 = 100_000;
         let (server, plugin) = setup(MINER, SATS).await;
-        let invoice = test_invoice(
-            "1m",
-            "0102030405060708090a0b0c0d0e0f1011121314151617181a1b1c1d1e1f2021",
-        );
-        let lnurl_body = LNURL_RESPONSE_OK.replace("INVOICE_PLACEHOLDER", &invoice);
+        // h tag = sha256 of the LNURL metadata, per LUD-06.
+        let invoice = test_invoice("1m", &sha256_hex(LNURL_METADATA));
+        let lnurl_body = lnurl_response_ok(&invoice);
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/.well-known/lnurlp/happy"))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(lnurl_body))
@@ -686,11 +744,8 @@ mod tests {
         const SATS: u64 = 100_000;
         let (server, plugin) = setup(MINER, SATS).await;
         // Invoice claims a different amount than requested.
-        let invoice = test_invoice(
-            "50m",
-            "0102030405060708090a0b0c0d0e0f1011121314151617181a1b1c1d1e1f2021",
-        );
-        let lnurl_body = LNURL_RESPONSE_OK.replace("INVOICE_PLACEHOLDER", &invoice);
+        let invoice = test_invoice("50m", &sha256_hex(LNURL_METADATA));
+        let lnurl_body = lnurl_response_ok(&invoice);
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/.well-known/lnurlp/mismatch"))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(lnurl_body))
@@ -711,7 +766,7 @@ mod tests {
         const MINER: &str = "garbage";
         const SATS: u64 = 100_000;
         let (server, plugin) = setup(MINER, SATS).await;
-        let lnurl_body = LNURL_RESPONSE_OK.replace("INVOICE_PLACEHOLDER", "not-a-bolt11");
+        let lnurl_body = lnurl_response_ok("not-a-bolt11");
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/.well-known/lnurlp/garbage"))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(lnurl_body))
@@ -728,11 +783,8 @@ mod tests {
         const MINER: &str = "lnfail";
         const SATS: u64 = 100_000;
         let (server, plugin) = setup(MINER, SATS).await;
-        let invoice = test_invoice(
-            "1m",
-            "0102030405060708090a0b0c0d0e0f1011121314151617181a1b1c1d1e1f2021",
-        );
-        let lnurl_body = LNURL_RESPONSE_OK.replace("INVOICE_PLACEHOLDER", &invoice);
+        let invoice = test_invoice("1m", &sha256_hex(LNURL_METADATA));
+        let lnurl_body = lnurl_response_ok(&invoice);
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/.well-known/lnurlp/lnfail"))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(lnurl_body))
@@ -761,6 +813,56 @@ mod tests {
         let (_server, plugin) = setup(MINER, SATS).await;
         let paid = plugin.payout_due().await.unwrap();
         assert!(paid.is_empty());
+        assert_eq!(plugin.balances().get(MINER), Some(&SATS));
+    }
+
+    #[tokio::test]
+    async fn payout_due_missing_metadata_fails_closed() {
+        const MINER: &str = "nometa";
+        const SATS: u64 = 100_000;
+        let (server, plugin) = setup(MINER, SATS).await;
+        // Even a structurally perfect invoice must be refused when the
+        // response carries no metadata to verify the h tag against.
+        let invoice = test_invoice("1m", &sha256_hex(LNURL_METADATA));
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/.well-known/lnurlp/nometa"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "status": "OK",
+                    "pr": invoice,
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let paid = plugin.payout_due().await.unwrap();
+        assert!(paid.is_empty(), "metadata-less response must fail closed");
+        assert_eq!(plugin.balances().get(MINER), Some(&SATS));
+    }
+
+    #[tokio::test]
+    async fn payout_due_wrong_description_hash_refuses_invoice() {
+        const MINER: &str = "wrongh";
+        const SATS: u64 = 100_000;
+        let (server, plugin) = setup(MINER, SATS).await;
+        // Invoice with a VALID h tag that does NOT match the metadata
+        // sha256 — e.g. an endpoint returning an arbitrary invoice.
+        let wrong_hash = "0102030405060708090a0b0c0d0e0f1011121314151617181a1b1c1d1e1f2021";
+        assert_ne!(wrong_hash, sha256_hex(LNURL_METADATA));
+        let invoice = test_invoice("1m", wrong_hash);
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/.well-known/lnurlp/wrongh"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_string(lnurl_response_ok(&invoice)),
+            )
+            .mount(&server)
+            .await;
+
+        let paid = plugin.payout_due().await.unwrap();
+        assert!(
+            paid.is_empty(),
+            "invoice whose h tag does not bind to the response metadata must not be paid"
+        );
         assert_eq!(plugin.balances().get(MINER), Some(&SATS));
     }
 }

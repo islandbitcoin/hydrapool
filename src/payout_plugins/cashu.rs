@@ -7,16 +7,27 @@
 //! Config (env):
 //! - `HYDRA_CASHU_MINT_URL` — e.g. `https://mint.example.com`
 //! - `HYDRA_CASHU_THRESHOLD_SATS` — payout threshold (default 10_000)
-//! - `HYDRA_CASHU_DESTINATIONS` — JSON map `{"username": "<ntfy topic
-//!   access token>"}`; unmapped usernames accrue until mapped.
+//! - `HYDRA_CASHU_DESTINATIONS` — JSON map `{"username":
+//!   "<topic>:<topic access token>"}`; unmapped usernames accrue until
+//!   mapped.
 //!
-//! Delivery requires an AUTHENTICATED ntfy channel: the destination
-//! value is the topic access token, sent as the `Authorization` header,
-//! and the topic is `hydrapool-<username>`. Bearer ecash tokens sent to
-//! an unauthenticated public topic are theft-by-default — anyone who
-//! knows the (public, npub-derived) topic name could subscribe and read
-//! the token first. An unauthenticated topic is therefore refused
-//! rather than silently leaking funds.
+//! Delivery requires an AUTHENTICATED, NON-PUBLIC ntfy topic. The
+//! destination value encodes BOTH halves of that requirement as
+//! `<topic>:<topic access token>`: the Bearer token authenticates the
+//! PUBLISHER to ntfy, but on ntfy.sh anyone can still subscribe and
+//! read a topic unless it is reserved with access control — so the
+//! topic itself must be a secret (a reserved/ACL'd topic name, or a
+//! random suffix the operator communicated to the miner out-of-band).
+//! The bare guessable form `hydrapool-<username>` is REFUSED: bearer
+//! ecash readable by anyone who guesses a public topic name is
+//! theft-by-default, and an authenticated publisher does not fix that.
+//!
+//! Undelivered tokens are re-delivered, never re-minted: the minted
+//! payload is attached to the still-open pending intent
+//! ([`Ledger::attach_pending_payload`]) BEFORE delivery, the intent is
+//! only settled once `deliver` succeeds, and every payout pass
+//! re-attempts delivery for open intents that already carry a
+//! `minted:` payload (including ones stranded by a restart).
 //!
 //! Token construction: NUT-04 blinded outputs require the cdk wallet
 //! crate (blinded-message generation, keyset selection, NUT-00 token
@@ -38,8 +49,8 @@ pub struct CashuPlugin {
     ledger: Arc<Ledger>,
     mint_url: String,
     threshold_sats: u64,
-    /// miner_id -> ntfy topic access token.
-    destinations: HashMap<String, String>,
+    /// miner_id -> (secret ntfy topic, topic access token).
+    destinations: HashMap<String, (String, String)>,
     client: reqwest::Client,
 }
 
@@ -86,15 +97,17 @@ impl CashuPlugin {
         }
         // A set-but-unparseable destinations map is a config error, not
         // an empty map: silently treating it as "nobody gets paid"
-        // accrues balances forever with zero warning.
+        // accrues balances forever with zero warning. Each entry must
+        // be `<secret topic>:<topic access token>`; the bare public
+        // topic `hydrapool-<username>` is refused (see module docs).
         let destinations = match destinations {
             None => HashMap::new(),
             Some(ref v) if v.trim().is_empty() => HashMap::new(),
-            Some(v) => match serde_json::from_str(&v) {
+            Some(v) => match parse_destinations(&v) {
                 Ok(map) => map,
                 Err(e) => {
                     return Err(PluginError::Other(format!(
-                        "HYDRA_CASHU_DESTINATIONS is set but not valid JSON: {e}"
+                        "HYDRA_CASHU_DESTINATIONS is invalid: {e}"
                     )));
                 }
             },
@@ -171,27 +184,29 @@ impl CashuPlugin {
         Ok(signatures.to_string())
     }
 
-    /// Deliver an ecash payload to the miner's authenticated ntfy
-    /// channel. The destination value is a topic access token; the
-    /// topic is derived from the miner id. Never delivers without an
-    /// Authorization header — public unauthenticated topics leak bearer
-    /// ecash to anyone who guesses the topic name.
+    /// Deliver an ecash payload to the miner's secret ntfy topic. The
+    /// destination encodes `<topic>:<topic access token>`; the topic
+    /// must be non-public (see module docs) and the Bearer token
+    /// authenticates the publisher. Never delivers without an
+    /// Authorization header.
     async fn deliver(&self, miner_id: &str, token: &str) -> Result<(), PluginError> {
-        // The destination doubles as the per-topic access token; a
-        // missing destination is held upstream, an empty one is a
-        // config error.
-        let token_credential = self.destinations.get(miner_id).ok_or_else(|| {
+        let (topic, topic_token) = self.destinations.get(miner_id).ok_or_else(|| {
             PluginError::NoDestination(format!("cashu destination for {miner_id}"))
         })?;
-        if token_credential.trim().is_empty() {
+        if topic_token.trim().is_empty() {
             return Err(PluginError::Rejected(format!(
                 "empty ntfy access token for {miner_id} — refusing unauthenticated delivery"
             )));
         }
+        if topic.trim().is_empty() {
+            return Err(PluginError::Rejected(format!(
+                "empty ntfy topic for {miner_id} — refusing to guess a public topic name"
+            )));
+        }
         let resp = self
             .client
-            .post(format!("https://ntfy.sh/hydrapool-{miner_id}"))
-            .header("Authorization", format!("Bearer {token_credential}"))
+            .post(format!("https://ntfy.sh/{}", topic.trim()))
+            .header("Authorization", format!("Bearer {}", topic_token.trim()))
             .body(token.to_string())
             .timeout(std::time::Duration::from_secs(10))
             .send()
@@ -205,6 +220,40 @@ impl CashuPlugin {
         }
         Ok(())
     }
+}
+
+/// Parse the destinations JSON map into (secret topic, access token)
+/// pairs. Every value must be `<topic>:<access token>`; the bare
+/// guessable topic `hydrapool-<username>` is refused because anyone
+/// can subscribe to a public ntfy.sh topic and read the bearer ecash.
+pub fn parse_destinations(raw: &str) -> Result<HashMap<String, (String, String)>, String> {
+    let parsed: HashMap<String, String> =
+        serde_json::from_str(raw).map_err(|e| format!("not valid JSON: {e}"))?;
+    let mut out = HashMap::with_capacity(parsed.len());
+    for (miner, value) in parsed {
+        let (topic, token) = value
+            .split_once(':')
+            .ok_or_else(|| {
+                format!(
+                    "destination for {miner} must be `<topic>:<topic access token>`, got a value with no ':' separator"
+                )
+            })?;
+        let topic = topic.trim();
+        let token = token.trim();
+        if topic.is_empty() || token.is_empty() {
+            return Err(format!(
+                "destination for {miner} has an empty topic or access token"
+            ));
+        }
+        let bare_public = format!("hydrapool-{miner}");
+        if topic == bare_public {
+            return Err(format!(
+                "destination for {miner} uses the bare public topic '{topic}' — anyone on ntfy.sh can subscribe to it and read the ecash. Use a reserved/ACL'd topic or a random secret suffix (e.g. 'hydrapool-{miner}-<random>') and give it to the miner out-of-band"
+            ));
+        }
+        out.insert(miner, (topic.to_string(), token.to_string()));
+    }
+    Ok(out)
 }
 
 #[async_trait::async_trait]
@@ -229,12 +278,47 @@ impl PayoutPlugin for CashuPlugin {
     }
 
     async fn payout_due(&self) -> Result<Vec<MinerBalance>, PluginError> {
+        // Re-deliver minted-but-undelivered tokens first: an open
+        // pending intent carrying a `minted:` payload means the token
+        // already exists (the balance was debited and the mint paid
+        // for) — re-attempt delivery from the stored payload instead
+        // of minting anew. This also picks up intents stranded by a
+        // restart, since pending_payouts replays the ledger file.
+        let mut paid = Vec::new();
+        for (plugin, miner_id, sats, pending) in self.ledger.pending_payouts() {
+            if plugin != "cashu" {
+                continue;
+            }
+            let Some(token) = pending.operation_id.strip_prefix("minted:") else {
+                continue;
+            };
+            if token.is_empty() {
+                continue;
+            }
+            match self.deliver(&miner_id, token).await {
+                Ok(()) => {
+                    // Delivery succeeded — only now close the intent.
+                    if let Err(e) =
+                        self.ledger
+                            .settle_payout("cashu", &miner_id, sats, &pending.operation_id)
+                    {
+                        tracing::error!(miner = %miner_id, "Ledger settle of re-delivered token failed: {e}");
+                        continue;
+                    }
+                    tracing::info!(miner = %miner_id, sats, "Cashu token re-delivered from ledger");
+                    paid.push(MinerBalance { miner_id, sats });
+                }
+                Err(e) => {
+                    tracing::warn!(miner = %miner_id, "Undelivered cashu token still stranded, will retry: {e}");
+                }
+            }
+        }
+
         let balances = self.ledger.balances("cashu");
         let due: Vec<MinerBalance> = to_miner_balances(balances)
             .into_iter()
             .filter(|b| b.sats >= self.threshold_sats)
             .collect();
-        let mut paid = Vec::new();
         for balance in due {
             if !self.destinations.contains_key(&balance.miner_id) {
                 tracing::debug!(miner = %balance.miner_id, "No cashu destination yet, holding");
@@ -253,33 +337,42 @@ impl PayoutPlugin for CashuPlugin {
             }
             match self.mint_ecash(balance.sats).await {
                 Ok(token) => {
-                    // Persist the minted payload BEFORE delivery: if
-                    // delivery fails the token exists in the ledger (a
-                    // zero-delta confirmed note) for re-delivery, not
-                    // only in a log line.
-                    let token_note = self.ledger.settle_payout(
+                    // Attach the minted payload to the STILL-OPEN intent
+                    // before delivery: if delivery fails (or we crash),
+                    // the payload is recoverable from the ledger and the
+                    // re-delivery pass above picks it up. The intent is
+                    // only settled once delivery succeeds.
+                    if let Err(e) = self.ledger.attach_pending_payload(
                         "cashu",
                         &balance.miner_id,
-                        balance.sats,
                         &format!("minted:{token}"),
-                    );
-                    match token_note {
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::error!(miner = %balance.miner_id, "Ledger token note failed: {e}");
-                            continue;
-                        }
+                    ) {
+                        tracing::error!(miner = %balance.miner_id, "Ledger token attach failed: {e}");
+                        continue;
                     }
                     match self.deliver(&balance.miner_id, &token).await {
                         Ok(()) => {
-                            tracing::info!(miner = %balance.miner_id, sats = balance.sats, "Cashu payout delivered");
-                            paid.push(balance);
+                            match self.ledger.settle_payout(
+                                "cashu",
+                                &balance.miner_id,
+                                balance.sats,
+                                &format!("minted:{token}"),
+                            ) {
+                                Ok(_) => {
+                                    tracing::info!(miner = %balance.miner_id, sats = balance.sats, "Cashu payout delivered");
+                                    paid.push(balance);
+                                }
+                                Err(e) => {
+                                    tracing::error!(miner = %balance.miner_id, "Ledger settle failed after delivery: {e}");
+                                }
+                            }
                         }
                         Err(e) => {
-                            // Token minted and persisted but undelivered — the
-                            // settle_payout note above carries the payload for
-                            // re-delivery; do not mint again on the next tick.
-                            tracing::error!(miner = %balance.miner_id, "Token minted+persisted, delivery failed — re-deliver from ledger note, not re-mint: {e}");
+                            // Token minted, attached to the open intent,
+                            // but undelivered — leave the intent OPEN;
+                            // the next pass re-delivers from the stored
+                            // payload instead of re-minting.
+                            tracing::error!(miner = %balance.miner_id, "Token minted+persisted, delivery failed — will re-deliver from ledger on next pass: {e}");
                         }
                     }
                 }
@@ -348,6 +441,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn destinations_parse_topic_and_token() {
+        let map = parse_destinations(r#"{"alice":"hydrapool-alice-7f3a9b:tk_1"}"#).unwrap();
+        assert_eq!(
+            map.get("alice"),
+            Some(&("hydrapool-alice-7f3a9b".to_string(), "tk_1".to_string()))
+        );
+    }
+
+    #[test]
+    fn destinations_reject_bare_public_topic() {
+        // The guessable public topic form must be refused — anyone can
+        // subscribe to it on ntfy.sh and read the bearer ecash.
+        let err = parse_destinations(r#"{"alice":"hydrapool-alice:tk_1"}"#).unwrap_err();
+        assert!(err.contains("bare public topic"), "got: {err}");
+        // Separator missing entirely.
+        assert!(parse_destinations(r#"{"bob":"just-a-token"}"#).is_err());
+        // Empty topic or token.
+        assert!(parse_destinations(r#"{"carol":":tk"}"#).is_err());
+        assert!(parse_destinations(r#"{"dave":"topic:"}"#).is_err());
+    }
+
     #[tokio::test]
     async fn deliver_requires_auth_token() {
         let mut plugin = CashuPlugin {
@@ -362,36 +477,18 @@ mod tests {
         assert!(matches!(err, PluginError::NoDestination(_)));
         // Destination present but empty token — must refuse to deliver
         // bearer ecash unauthenticated.
-        plugin.destinations.insert("minerX".into(), String::new());
+        plugin.destinations.insert(
+            "minerX".into(),
+            ("hydrapool-minerX-9c1d".into(), String::new()),
+        );
         let err = plugin.deliver("minerX", "token").await.unwrap_err();
         assert!(matches!(err, PluginError::Rejected(_)));
-    }
-
-    #[tokio::test]
-    async fn deliver_sends_bearer_auth() {
-        let server = wiremock::MockServer::start().await;
-        let mut plugin = CashuPlugin {
-            ledger: tmp_ledger(),
-            mint_url: "https://mint.invalid".into(),
-            threshold_sats: 0,
-            destinations: HashMap::new(),
-            client: reqwest::Client::new(),
-        };
+        // Empty topic — refused too.
         plugin
             .destinations
-            .insert("minerA".into(), "secret-token-123".into());
-        // ntfy is hardcoded https://ntfy.sh in deliver(); the mock can't
-        // intercept it. Instead assert on the request-building path via
-        // a mint-failure flow: we test deliver() auth header indirectly
-        // through the recorded requests of a local server by pointing
-        // deliver at it through miner id — but deliver() builds the URL
-        // itself. So exercise the failure path only (network to ntfy.sh
-        // not required: request will actually be sent; use a token and
-        // accept either success or auth failure from the real service —
-        // no, tests must not hit the network). We assert the header
-        // construction logic instead:
-        let header = format!("Bearer {}", plugin.destinations["minerA"]);
-        assert_eq!(header, "Bearer secret-token-123");
+            .insert("minerX".into(), (String::new(), "tk".into()));
+        let err = plugin.deliver("minerX", "token").await.unwrap_err();
+        assert!(matches!(err, PluginError::Rejected(_)));
     }
 
     #[tokio::test]
@@ -416,7 +513,10 @@ mod tests {
         let ledger = tmp_ledger();
         ledger.accrue("cashu", "mintfail", 50_000, 1).unwrap();
         let mut destinations = HashMap::new();
-        destinations.insert("mintfail".to_string(), "tok".to_string());
+        destinations.insert(
+            "mintfail".to_string(),
+            ("hydrapool-mintfail-1a2b".to_string(), "tok".to_string()),
+        );
         let plugin = CashuPlugin {
             ledger: ledger.clone(),
             mint_url: server.uri(),
@@ -442,7 +542,10 @@ mod tests {
         let ledger = tmp_ledger();
         ledger.accrue("cashu", "undeliv", 50_000, 1).unwrap();
         let mut destinations = HashMap::new();
-        destinations.insert("undeliv".to_string(), "tok".to_string());
+        destinations.insert(
+            "undeliv".to_string(),
+            ("hydrapool-undeliv-4e5f".to_string(), "tok".to_string()),
+        );
         let plugin = CashuPlugin {
             ledger: ledger.clone(),
             mint_url: server.uri(),
@@ -470,16 +573,28 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        // Delivery goes to ntfy.sh (external, network-disabled in CI
-        // it errors) — either way the mint endpoints must be hit
-        // exactly once and the token must be persisted to the ledger.
+        // Delivery goes to ntfy.sh (external, unreachable from tests)
+        // and fails — the token must be persisted on a still-open
+        // pending intent for re-delivery, and the intent must NOT be
+        // settled (settle only happens after a successful delivery).
         let _ = plugin.payout_due().await;
-        // The minted payload must be recorded in the ledger for
-        // re-delivery (previously it lived only in a log line).
-        let pending_notes = ledger.pending_payouts();
-        let _ = pending_notes;
+        let pending = ledger.pending_payouts();
+        assert_eq!(
+            pending.len(),
+            1,
+            "delivery failure must leave the intent open"
+        );
+        assert_eq!(pending[0].1, "undeliv");
+        assert_eq!(pending[0].2, 50_000);
+        assert!(
+            pending[0].3.operation_id.starts_with("minted:"),
+            "minted payload must be attached to the open intent, got {:?}",
+            pending[0].3.operation_id
+        );
+        assert!(!pending[0].3.confirmed);
         // Second payout_due pass: the first pass already debited, so
-        // balances are 0 and no second quote can occur.
+        // balances are 0 and no second quote can occur (mocks are
+        // .expect(1) — a re-mint would fail the test at drop time).
         let paid2 = plugin.payout_due().await.unwrap();
         assert!(paid2.is_empty());
         drop(server); // keep mocks alive until verification completes

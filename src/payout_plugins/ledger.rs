@@ -234,12 +234,16 @@ impl Ledger {
 
     /// Read the still-open pending payout entries from the ledger
     /// file. Used at startup to reconcile in-flight payments against
-    /// the backend instead of re-paying them.
+    /// the backend instead of re-paying them, and by the cashu plugin
+    /// to find minted-but-undelivered tokens for re-delivery.
     ///
     /// A `begin_payout` opens a pending debit; a later `settle_payout`
     /// (zero-delta, confirmed) or `rollback_payout` (positive delta,
     /// confirmed) closes the oldest open pending debit for the same
-    /// (plugin, miner). Entries left open after pairing are returned.
+    /// (plugin, miner). A zero-delta UNCONFIRMED entry with a non-empty
+    /// operation id ([`Ledger::attach_pending_payload`]) records a
+    /// payload (e.g. a minted ecash token) on the most recent open
+    /// intent. Entries left open after pairing are returned.
     pub fn pending_payouts(&self) -> Vec<(String, String, u64, PendingPayout)> {
         let mut open: Vec<(String, String, u64, PendingPayout)> = Vec::new();
         if !self.path.exists() {
@@ -253,17 +257,76 @@ impl Ledger {
                 let Some(p) = entry.pending else { continue };
                 if !p.confirmed && entry.delta_sats < 0 {
                     open.push((entry.plugin, entry.miner_id, (-entry.delta_sats) as u64, p));
+                } else if !p.confirmed && entry.delta_sats == 0 && !p.operation_id.is_empty() {
+                    // Payload attach: record it on the most recent open
+                    // intent for this (plugin, miner).
+                    if let Some(slot) = open
+                        .iter_mut()
+                        .rev()
+                        .find(|(pl, m, _, _)| *pl == entry.plugin && *m == entry.miner_id)
+                    {
+                        slot.3.operation_id = p.operation_id;
+                    }
                 } else if p.confirmed {
                     // A settle (delta 0) or rollback (delta > 0) closes
                     // the oldest open pending debit for this miner.
                     if let Some(pos) = open
                         .iter()
-                        .position(|(pl, m, _, _)| pl == &entry.plugin && m == &entry.miner_id)
+                        .position(|(pl, m, _, _)| *pl == entry.plugin && *m == entry.miner_id)
                     {
                         open.remove(pos);
                     }
                 }
             }
+        }
+        open
+    }
+
+    /// Attach a payload (e.g. a minted ecash token) to the still-open
+    /// pending payout for (plugin, miner) as a zero-delta unconfirmed
+    /// entry. Written BEFORE delivery so a delivery failure or crash
+    /// leaves the payload recoverable from the ledger — re-deliver it,
+    /// never re-mint. No-op on balances; must be called between
+    /// `begin_payout` and `settle_payout`/`rollback_payout`.
+    pub fn attach_pending_payload(
+        &self,
+        plugin: &str,
+        miner_id: &str,
+        payload: &str,
+    ) -> std::io::Result<()> {
+        self.append(LedgerEntry {
+            plugin: plugin.to_string(),
+            miner_id: miner_id.to_string(),
+            delta_sats: 0,
+            ts: now(),
+            block_height: 0,
+            pending: Some(PendingPayout {
+                operation_id: payload.to_string(),
+                confirmed: false,
+            }),
+        })
+    }
+
+    /// Startup reconciliation for stranded pending payouts.
+    ///
+    /// Returns every still-open pending intent and logs an error per
+    /// intent with plugin/miner/sats/operation_id, so a crash between
+    /// `begin_payout` and settle/rollback is visible to the operator
+    /// instead of silently stranding the miner's debited credit.
+    /// Backend-specific settlement (query LND by payment_hash, the
+    /// gateway by operation_id, ...) is a manual follow-up until a
+    /// payment-status API lands per plugin; the cashu plugin
+    /// additionally re-delivers `minted:` payloads automatically.
+    pub fn stranded_pending_payouts(&self) -> Vec<(String, String, u64, PendingPayout)> {
+        let open = self.pending_payouts();
+        for (plugin, miner, sats, pending) in &open {
+            tracing::error!(
+                plugin = %plugin,
+                miner = %miner,
+                sats = sats,
+                operation_id = %pending.operation_id,
+                "STRANDED PAYOUT from a previous run: balance debited, payment state unknown — reconcile against the backend by operation_id"
+            );
         }
         open
     }
@@ -314,8 +377,33 @@ pub fn to_miner_balances(balances: HashMap<String, u64>) -> Vec<MinerBalance> {
 mod tests {
     use super::*;
 
+    /// Unique-per-call suffix for test temp dirs: tests run in
+    /// parallel in one process, so pid alone is not unique enough to
+    /// keep one test's remove_dir_all from deleting another's files.
+    /// An atomic counter guarantees uniqueness within the process
+    /// (clock nanos can collide on platforms with ~1us resolution).
+    fn test_dir_nonce() -> u128 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst) as u128;
+        (n << 64)
+            | (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+                & 0xffff_ffff_ffff_ffff)
+    }
+
     fn tmp_ledger() -> Ledger {
-        let dir = std::env::temp_dir().join(format!("hydrapool-ledger-{}", std::process::id()));
+        // Key by pid + unique nonce: tests run in parallel within one
+        // process, so a pid-only name would let one test's
+        // remove_dir_all yank the files out from under another
+        // concurrently running test.
+        let dir = std::env::temp_dir().join(format!(
+            "hydrapool-ledger-{}-{}",
+            std::process::id(),
+            test_dir_nonce()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         Ledger::open(dir.join("ledger.jsonl")).unwrap()
@@ -352,7 +440,11 @@ mod tests {
 
     #[test]
     fn state_replays_from_disk() {
-        let dir = std::env::temp_dir().join(format!("hydrapool-replay-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "hydrapool-replay-{}-{}",
+            std::process::id(),
+            test_dir_nonce()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("ledger.jsonl");
@@ -367,7 +459,11 @@ mod tests {
 
     #[test]
     fn torn_final_line_is_skipped() {
-        let dir = std::env::temp_dir().join(format!("hydrapool-torn-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "hydrapool-torn-{}-{}",
+            std::process::id(),
+            test_dir_nonce()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("ledger.jsonl");
@@ -421,7 +517,11 @@ mod tests {
 
     #[test]
     fn unconfirmed_payouts_replay_after_restart() {
-        let dir = std::env::temp_dir().join(format!("hydrapool-pending-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "hydrapool-pending-{}-{}",
+            std::process::id(),
+            test_dir_nonce()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("ledger.jsonl");
@@ -445,5 +545,59 @@ mod tests {
         // The confirmed settle must not appear, and balance reflects
         // both debits.
         assert_eq!(reopened.balances("lightning").get("minerR"), Some(&200));
+    }
+
+    #[test]
+    fn attached_payload_surfaces_on_open_intent() {
+        let ledger = tmp_ledger();
+        ledger.accrue("cashu", "minerU", 1_000, 1).unwrap();
+        ledger.begin_payout("cashu", "minerU", 1_000).unwrap();
+        ledger
+            .attach_pending_payload("cashu", "minerU", "minted:TOKEN-1")
+            .unwrap();
+
+        let pending = ledger.pending_payouts();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, "cashu");
+        assert_eq!(pending[0].1, "minerU");
+        assert_eq!(pending[0].2, 1_000);
+        assert_eq!(pending[0].3.operation_id, "minted:TOKEN-1");
+        assert!(!pending[0].3.confirmed);
+
+        // Settling after delivery closes the intent — the payload no
+        // longer surfaces.
+        ledger
+            .settle_payout("cashu", "minerU", 1_000, "minted:TOKEN-1")
+            .unwrap();
+        assert!(ledger.pending_payouts().is_empty());
+    }
+
+    #[test]
+    fn stranded_intent_survives_restart_without_payload() {
+        let dir = std::env::temp_dir().join(format!(
+            "hydrapool-stranded-{}-{}",
+            std::process::id(),
+            test_dir_nonce()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ledger.jsonl");
+        {
+            let ledger = Ledger::open(path.clone()).unwrap();
+            ledger.accrue("lightning", "minerC", 2_000, 1).unwrap();
+            // Simulate a crash between begin_payout and settle/rollback.
+            ledger.begin_payout("lightning", "minerC", 1_200).unwrap();
+        }
+        let reopened = Ledger::open(path).unwrap();
+        let stranded = reopened.stranded_pending_payouts();
+        assert_eq!(
+            stranded.len(),
+            1,
+            "crash between begin and settle must leave a visible stranded intent"
+        );
+        assert_eq!(stranded[0].1, "minerC");
+        assert_eq!(stranded[0].2, 1_200);
+        // Balance stays debited — no double-credit, operator reconciles.
+        assert_eq!(reopened.balances("lightning").get("minerC"), Some(&800));
     }
 }

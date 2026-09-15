@@ -19,11 +19,26 @@ impl PayoutPluginRegistry {
     /// Build a registry from env config. Each plugin enables itself by
     /// presence of its env vars; plugins that fail to configure are
     /// logged and skipped so a broken one can't take the pool down.
+    ///
+    /// Startup reconciliation happens here, right after the ledger is
+    /// opened: pending intents left open by a crash between
+    /// `begin_payout` and settle/rollback are surfaced via
+    /// [`Ledger::stranded_pending_payouts`] (an error log per intent)
+    /// so the operator sees stranded payouts instead of the miner's
+    /// debited credit silently vanishing.
     pub fn from_env(ledger_path: std::path::PathBuf) -> Result<Self, String> {
         let ledger = Arc::new(
             crate::payout_plugins::ledger::Ledger::open(ledger_path)
                 .map_err(|e| format!("opening payout ledger: {e}"))?,
         );
+        let stranded = ledger.stranded_pending_payouts();
+        if !stranded.is_empty() {
+            tracing::error!(
+                count = stranded.len(),
+                "payout ledger has {} open pending payout(s) from a previous run — see the per-intent errors above",
+                stranded.len()
+            );
+        }
         let mut registry = Self::new();
         match crate::payout_plugins::lightning::LightningPlugin::from_env(ledger.clone()) {
             Ok(p) => registry.register(Arc::new(p)),
