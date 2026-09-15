@@ -55,9 +55,12 @@ impl std::error::Error for PluginError {}
 
 /// A payout plugin.
 ///
-/// Implementations must be cheap to notify — heavy work (HTTP calls,
-/// invoice fetch) belongs in [`PayoutPlugin::run`] which is spawned on
-/// its own tokio task by the registry.
+/// The registry drives plugins: it calls [`PayoutPlugin::on_block`] as
+/// confirmed shares arrive and [`PayoutPlugin::payout_due`] on a fixed
+/// interval (see [`crate::payout_plugins::registry`]). There is no
+/// per-plugin task lifecycle — long-lived work (polling invoice status,
+/// federation clients) should be added to the trait only when a real
+/// consumer exists.
 ///
 /// The plugin owns its destination mapping: how `miner_id` (the stratum
 /// username) resolves to a payout destination (invoice, npub keyset,
@@ -77,12 +80,13 @@ pub trait PayoutPlugin: Send + Sync {
     /// Drain all miners whose accrued balance is at or above
     /// [`PayoutPlugin::threshold_sats`], paying out via the plugin's
     /// backend. Returns the miners successfully paid.
+    ///
+    /// Implementations must follow the ledger's pending-intent protocol:
+    /// `begin_payout` before dispatching any payment, `settle_payout`
+    /// after confirmation, `rollback_payout` when the payment did not
+    /// happen. This keeps pay-then-crash from double-paying or losing
+    /// credit.
     async fn payout_due(&self) -> Result<Vec<MinerBalance>, PluginError>;
-
-    /// Launch any long-lived tasks (polling invoice status, federation
-    /// clients, ...). Called once at startup; the returned future should
-    /// run until the shutdown signal fires.
-    async fn run(&self, shutdown: tokio::sync::watch::Receiver<bool>) -> Result<(), PluginError>;
 
     /// Snapshot of accrued balances, for the stats/API surface.
     fn balances(&self) -> HashMap<String, u64>;

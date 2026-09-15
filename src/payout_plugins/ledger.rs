@@ -21,6 +21,25 @@ struct LedgerEntry {
     ts: u64,
     /// Height of the block that triggered the entry (0 for payouts).
     block_height: u32,
+    /// Optional pending-payout marker. When present, this entry moved
+    /// `delta_sats` out of the accrued balance but the payment has not
+    /// been confirmed yet; `confirmed == false` entries must be
+    /// reconciled against the backend on restart before re-paying.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending: Option<PendingPayout>,
+}
+
+/// A payout dispatched but not yet settled. Written to the ledger
+/// BEFORE the payment is sent so a crash between pay and record leaves
+/// a recoverable trace instead of double-paying on the next tick.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PendingPayout {
+    /// Backend identifier for the in-flight payment (LND payment_hash,
+    /// gateway operation_id, mint quote id). Empty when the backend
+    /// has not yet assigned one.
+    pub operation_id: String,
+    /// true once the backend confirmed the payment settled.
+    pub confirmed: bool,
 }
 
 /// In-memory ledger state: plugin -> miner_id -> accrued sats.
@@ -45,9 +64,7 @@ impl Ledger {
                     tracing::warn!("Skipping unparseable ledger line: {line}");
                     continue;
                 };
-                *state
-                    .entry((entry.plugin, entry.miner_id))
-                    .or_insert(0) += entry.delta_sats;
+                *state.entry((entry.plugin, entry.miner_id)).or_insert(0) += entry.delta_sats;
             }
         } else if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -71,24 +88,21 @@ impl Ledger {
             miner_id: miner_id.to_string(),
             delta_sats: sats as i64,
             ts: now(),
-            block_height: block_height,
+            block_height,
+            pending: None,
         })
     }
 
     /// Record a payout of `sats` (a negative delta). Returns the
     /// remaining balance, or an error if the payout exceeds the balance.
-    pub fn record_payout(
-        &self,
-        plugin: &str,
-        miner_id: &str,
-        sats: u64,
-    ) -> Result<u64, String> {
+    pub fn record_payout(&self, plugin: &str, miner_id: &str, sats: u64) -> Result<u64, String> {
         let entry = LedgerEntry {
             plugin: plugin.to_string(),
             miner_id: miner_id.to_string(),
             delta_sats: -(sats as i64),
             ts: now(),
             block_height: 0,
+            pending: None,
         };
         // Compute + append while holding the lock once — `append` also
         // locks, so releasing first would race with a concurrent payout.
@@ -102,7 +116,8 @@ impl Ledger {
                 ));
             }
             let new_balance = balance - sats as i64;
-            self.append_entry(&mut state, entry).map_err(|e| e.to_string())?;
+            self.append_entry(&mut state, entry)
+                .map_err(|e| e.to_string())?;
             new_balance
         };
         Ok(balance as u64)
@@ -117,6 +132,140 @@ impl Ledger {
             .filter(|((p, _), v)| p == plugin && **v > 0)
             .map(|((_, m), v)| (m.clone(), *v as u64))
             .collect()
+    }
+
+    /// Open a pending payout: atomically debit `sats` from the accrued
+    /// balance and write an unconfirmed pending entry. Call BEFORE
+    /// dispatching the payment. Returns the pending id, or an error if
+    /// the balance is insufficient. On success the miner's accrued
+    /// balance is reduced; if the payment later fails, call
+    /// [`Ledger::rollback_payout`] to restore it.
+    pub fn begin_payout(&self, plugin: &str, miner_id: &str, sats: u64) -> Result<u64, String> {
+        let entry = LedgerEntry {
+            plugin: plugin.to_string(),
+            miner_id: miner_id.to_string(),
+            delta_sats: -(sats as i64),
+            ts: now(),
+            block_height: 0,
+            pending: Some(PendingPayout {
+                operation_id: String::new(),
+                confirmed: false,
+            }),
+        };
+        let pending_id = {
+            let mut state = self.state.lock().unwrap();
+            let key = (plugin.to_string(), miner_id.to_string());
+            let balance = state.get(&key).copied().unwrap_or(0);
+            if (sats as i64) > balance {
+                return Err(format!(
+                    "payout {sats} sats exceeds accrued {balance} sats for {miner_id}"
+                ));
+            }
+            let new_balance = balance - sats as i64;
+            self.append_entry(&mut state, entry)
+                .map_err(|e| e.to_string())?;
+            new_balance as u64
+        };
+        Ok(pending_id)
+    }
+
+    /// Confirm a pending payout after the backend reported success.
+    /// `sats` is the amount that was paid (for log/audit parity with
+    /// `begin_payout`); the accrued balance was already debited by
+    /// `begin_payout`, so this only records the confirmation.
+    /// Returns the remaining accrued balance.
+    pub fn settle_payout(
+        &self,
+        plugin: &str,
+        miner_id: &str,
+        _sats: u64,
+        operation_id: &str,
+    ) -> Result<u64, String> {
+        let entry = LedgerEntry {
+            plugin: plugin.to_string(),
+            miner_id: miner_id.to_string(),
+            delta_sats: 0,
+            ts: now(),
+            block_height: 0,
+            pending: Some(PendingPayout {
+                operation_id: operation_id.to_string(),
+                confirmed: true,
+            }),
+        };
+        let balance = {
+            let mut state = self.state.lock().unwrap();
+            self.append_entry(&mut state, entry)
+                .map_err(|e| e.to_string())?;
+            state
+                .get(&(plugin.to_string(), miner_id.to_string()))
+                .copied()
+                .unwrap_or(0)
+        };
+        Ok(balance as u64)
+    }
+
+    /// Roll a pending payout back (payment did not happen): restore the
+    /// accrued balance and leave a confirmed zero-delta note explaining
+    /// why. Idempotent per call site — callers invoke this exactly once
+    /// per failed payment.
+    pub fn rollback_payout(&self, plugin: &str, miner_id: &str, sats: u64) -> Result<u64, String> {
+        let entry = LedgerEntry {
+            plugin: plugin.to_string(),
+            miner_id: miner_id.to_string(),
+            delta_sats: sats as i64,
+            ts: now(),
+            block_height: 0,
+            pending: Some(PendingPayout {
+                operation_id: String::new(),
+                confirmed: true,
+            }),
+        };
+        let balance = {
+            let mut state = self.state.lock().unwrap();
+            self.append_entry(&mut state, entry)
+                .map_err(|e| e.to_string())?;
+            state
+                .get(&(plugin.to_string(), miner_id.to_string()))
+                .copied()
+                .unwrap_or(0)
+        };
+        Ok(balance as u64)
+    }
+
+    /// Read the still-open pending payout entries from the ledger
+    /// file. Used at startup to reconcile in-flight payments against
+    /// the backend instead of re-paying them.
+    ///
+    /// A `begin_payout` opens a pending debit; a later `settle_payout`
+    /// (zero-delta, confirmed) or `rollback_payout` (positive delta,
+    /// confirmed) closes the oldest open pending debit for the same
+    /// (plugin, miner). Entries left open after pairing are returned.
+    pub fn pending_payouts(&self) -> Vec<(String, String, u64, PendingPayout)> {
+        let mut open: Vec<(String, String, u64, PendingPayout)> = Vec::new();
+        if !self.path.exists() {
+            return open;
+        }
+        if let Ok(file) = std::fs::File::open(&self.path) {
+            for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+                let Ok(entry) = serde_json::from_str::<LedgerEntry>(&line) else {
+                    continue;
+                };
+                let Some(p) = entry.pending else { continue };
+                if !p.confirmed && entry.delta_sats < 0 {
+                    open.push((entry.plugin, entry.miner_id, (-entry.delta_sats) as u64, p));
+                } else if p.confirmed {
+                    // A settle (delta 0) or rollback (delta > 0) closes
+                    // the oldest open pending debit for this miner.
+                    if let Some(pos) = open
+                        .iter()
+                        .position(|(pl, m, _, _)| pl == &entry.plugin && m == &entry.miner_id)
+                    {
+                        open.remove(pos);
+                    }
+                }
+            }
+        }
+        open
     }
 
     fn append(&self, entry: LedgerEntry) -> std::io::Result<()> {
@@ -140,9 +289,7 @@ impl Ledger {
             .open(&self.path)?;
         writeln!(f, "{line}")?;
         f.flush()?;
-        *state
-            .entry((entry.plugin, entry.miner_id))
-            .or_insert(0) += entry.delta_sats;
+        *state.entry((entry.plugin, entry.miner_id)).or_insert(0) += entry.delta_sats;
         Ok(())
     }
 }
@@ -229,11 +376,74 @@ mod tests {
         drop(ledger);
         // Simulate a torn write: append a partial JSON line.
         {
-            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
             use std::io::Write;
             write!(f, "{{\"plugin\":\"ca").unwrap();
         }
         let reopened = Ledger::open(path).unwrap();
         assert_eq!(reopened.balances("cashu").get("npubY"), Some(&900));
+    }
+
+    #[test]
+    fn pending_payout_debits_then_rollback_restores() {
+        let ledger = tmp_ledger();
+        ledger.accrue("lightning", "minerP", 1_000, 5).unwrap();
+        // begin debits the balance immediately.
+        ledger.begin_payout("lightning", "minerP", 600).unwrap();
+        assert_eq!(ledger.balances("lightning").get("minerP"), Some(&400));
+        // Payment failed — restore.
+        ledger.rollback_payout("lightning", "minerP", 600).unwrap();
+        assert_eq!(ledger.balances("lightning").get("minerP"), Some(&1_000));
+    }
+
+    #[test]
+    fn pending_payout_settle_keeps_debit() {
+        let ledger = tmp_ledger();
+        ledger.accrue("lightning", "minerS", 1_000, 5).unwrap();
+        ledger.begin_payout("lightning", "minerS", 600).unwrap();
+        ledger
+            .settle_payout("lightning", "minerS", 600, "abc123")
+            .unwrap();
+        // Payment succeeded — debit stays.
+        assert_eq!(ledger.balances("lightning").get("minerS"), Some(&400));
+    }
+
+    #[test]
+    fn begin_payout_over_balance_rejected() {
+        let ledger = tmp_ledger();
+        ledger.accrue("cashu", "minerB", 100, 1).unwrap();
+        assert!(ledger.begin_payout("cashu", "minerB", 101).is_err());
+        assert_eq!(ledger.balances("cashu").get("minerB"), Some(&100));
+    }
+
+    #[test]
+    fn unconfirmed_payouts_replay_after_restart() {
+        let dir = std::env::temp_dir().join(format!("hydrapool-pending-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ledger.jsonl");
+        {
+            let ledger = Ledger::open(path.clone()).unwrap();
+            ledger.accrue("lightning", "minerR", 2_000, 1).unwrap();
+            ledger.begin_payout("lightning", "minerR", 1_500).unwrap();
+            ledger
+                .settle_payout("lightning", "minerR", 1_500, "op1")
+                .unwrap();
+            ledger.begin_payout("lightning", "minerR", 300).unwrap();
+        }
+        let reopened = Ledger::open(path).unwrap();
+        let pending = reopened.pending_payouts();
+        assert_eq!(pending.len(), 1, "only the unsettled begin survives");
+        let (plugin, miner, sats, p) = &pending[0];
+        assert_eq!(plugin, "lightning");
+        assert_eq!(miner, "minerR");
+        assert_eq!(*sats, 300);
+        assert!(!p.confirmed);
+        // The confirmed settle must not appear, and balance reflects
+        // both debits.
+        assert_eq!(reopened.balances("lightning").get("minerR"), Some(&200));
     }
 }

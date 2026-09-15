@@ -45,9 +45,11 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 async-trait = "0.1"
+hex = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
+wiremock = "0.6"
 
 # p2poolv2_lib = { path = "../p2poolv2/p2poolv2_lib/" }
 # p2poolv2_cli = { path = "../p2poolv2/p2poolv2_cli/" }

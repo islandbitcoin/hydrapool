@@ -204,6 +204,8 @@ async fn main() -> ExitCode {
     let cloned_stratum_config = stratum_config.clone();
     let payout = Payout::new(cloned_stratum_config.network);
     let shared_pplns_window = payout.shared_pplns_window();
+    // Keep a window handle for the payout plugins' per-block accrual.
+    let plugin_pplns_window = shared_pplns_window.clone();
     let exit_sender_notify = exit_sender.clone();
     let exit_receiver_notify = exit_sender.subscribe();
     tokio::spawn(async move {
@@ -284,6 +286,9 @@ async fn main() -> ExitCode {
 
     let (monitoring_event_sender, _monitoring_event_receiver) =
         p2poolv2_lib::monitoring_events::create_monitoring_event_channel();
+    // Receiver for the payout plugins, subscribed before the sender is
+    // moved into the API server.
+    let plugin_event_rx = monitoring_event_sender.subscribe();
 
     let (node_handle, stopping_rx) = match NodeHandle::new(
         config.clone(),
@@ -330,7 +335,7 @@ async fn main() -> ExitCode {
 
     // Payout plugins: Lightning / Cashu / Fedimint out-of-band payouts.
     // Enabled independently by their env config; all disabled = no-op.
-    let plugin_shutdown_tx = tokio::sync::watch::channel(false).0;
+    let (plugin_shutdown_tx, plugin_shutdown_rx) = tokio::sync::watch::channel(false);
     match payout_plugins::registry::PayoutPluginRegistry::from_env(
         std::path::PathBuf::from(&config.store.path)
             .parent()
@@ -338,17 +343,67 @@ async fn main() -> ExitCode {
             .join("payout-ledger.jsonl"),
     ) {
         Ok(registry) if !registry.is_empty() => {
-            let registry = std::sync::Arc::new(registry);
-            let shutdown_rx = plugin_shutdown_tx.subscribe();
+            let payout_loop_registry = std::sync::Arc::new(registry);
+            let shutdown_rx = plugin_shutdown_rx.clone();
+            tokio::spawn({
+                let payout_loop_registry = payout_loop_registry.clone();
+                async move {
+                    payout_loop_registry
+                        .run_payout_loop(Duration::from_secs(60), shutdown_rx)
+                        .await;
+                }
+            });
+            // Wire confirmed share events into the plugins: every
+            // MonitoringEvent::Share emitted by the organise worker
+            // (post-promotion of a confirmed share) becomes a
+            // PluginContext with the per-miner distribution taken from
+            // the PPLNS window at that share's difficulty.
+            let block_registry = payout_loop_registry;
+            let network_for_payouts = stratum_config.network;
+            let payout_window = plugin_pplns_window;
             tokio::spawn(async move {
-                registry
-                    .run_payout_loop(Duration::from_secs(60), shutdown_rx)
-                    .await;
+                let mut event_rx = plugin_event_rx;
+                loop {
+                    match event_rx.recv().await {
+                        Ok(p2poolv2_lib::monitoring_events::MonitoringEvent::Share(share)) => {
+                            let miner_payouts = plugin_distribution_from_window(
+                                &share,
+                                &payout_window,
+                                network_for_payouts,
+                            );
+                            let ctx = payout_plugins::PluginContext {
+                                block_height: share.height,
+                                block_hash: share.blockhash.to_string(),
+                                block_reward_sats: plugin_block_reward_sats(share.height),
+                                miner_payouts,
+                            };
+                            block_registry.on_block(&ctx);
+                        }
+                        Ok(_) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            warn!("Payout plugin event stream lagged, skipped {n} events");
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    }
+                }
             });
             info!("Payout plugins active");
         }
         Ok(_) => info!("No payout plugins configured"),
-        Err(e) => warn!("Payout plugins unavailable: {e}"),
+        // A ledger open failure with payout plugins configured is a
+        // payment outage, not a warning: balances stop accruing and
+        // miners stop being paid. Log at error and record it in the
+        // metrics surface so dashboards see it.
+        Err(e) => {
+            error!("Payout plugins unavailable — configured plugins will NOT pay out: {e}");
+            let metrics = metrics_for_shutdown.get_metrics().await;
+            error!(
+                payout_plugin_status = "unavailable",
+                payout_plugin_error = %e,
+                total_users = metrics.users.len(),
+                "payout outage: plugin ledger failed to open"
+            );
+        }
     }
 
     let mut exit_receiver = exit_sender.subscribe();
@@ -374,6 +429,8 @@ async fn main() -> ExitCode {
         // channels might be closed already, ignore errors
         let _ = stratum_shutdown_tx.send(());
         let _ = api_shutdown_tx.send(());
+        // Stop the payout plugin loop before exiting.
+        let _ = plugin_shutdown_tx.send(true);
         // Notify signal handler to exit
         let _ = exit_sender.send(reason);
         reason
@@ -411,4 +468,74 @@ async fn main() -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// Bitcoin block subsidy in sats for `height` (50 BTC halving
+/// schedule). The pool's out-of-band plugin payouts mirror the
+/// on-chain coinbase subsidy; fees accrue to the block finder.
+fn plugin_block_reward_sats(height: u32) -> u64 {
+    const HALVING_INTERVAL: u64 = 210_000;
+    const INITIAL_SUBSIDY_SATS: u64 = 5_000_000_000;
+    let halvings = (height as u64) / HALVING_INTERVAL;
+    if halvings >= 64 {
+        0
+    } else {
+        INITIAL_SUBSIDY_SATS >> halvings
+    }
+}
+
+/// Per-miner sats for one confirmed share, taken from the PPLNS
+/// window's difficulty distribution at the time of confirmation.
+///
+/// The share's own difficulty determines the window slice
+/// (`get_distribution` walks entries up to that cumulative difficulty),
+/// and each miner's proportional slice of the subsidy is computed the
+/// same way the coinbase `append_proportional_distribution` does:
+/// difficulty-weighted, deterministic remainder assignment.
+fn plugin_distribution_from_window(
+    share: &p2poolv2_lib::store::dag_store::ShareInfo,
+    payout_window: &std::sync::Arc<
+        std::sync::RwLock<p2poolv2_lib::accounting::payout::sharechain_pplns::PplnsWindow>,
+    >,
+    network: bitcoin::Network,
+) -> Vec<payout_plugins::MinerBalance> {
+    // The confirmed share's own difficulty is the PPLNS threshold for
+    // this distribution.
+    let share_difficulty = bitcoin::Target::from_compact(share.bits).difficulty(network);
+
+    let Ok(mut window) = payout_window.write() else {
+        error!("PPLNS window lock poisoned — skipping plugin accrual");
+        return Vec::new();
+    };
+    let distribution = window.get_distribution(share_difficulty);
+    drop(window);
+
+    let total_difficulty: u128 = distribution.values().sum();
+    if total_difficulty == 0 {
+        return Vec::new();
+    }
+    let reward = plugin_block_reward_sats(share.height);
+    // Deterministic proportional split, remainder to the
+    // lexicographically-last address (matches the coinbase builder).
+    let mut entries: Vec<(&bitcoin::Address, &u128)> = distribution.iter().collect();
+    entries.sort_by_key(|(a, _)| a.to_string());
+    let mut allocated: u64 = 0;
+    let count = entries.len();
+    let mut payouts = Vec::with_capacity(count);
+    for (index, (address, difficulty)) in entries.into_iter().enumerate() {
+        let sats = if index == count - 1 {
+            reward.saturating_sub(allocated)
+        } else {
+            let s = ((reward as u128 * difficulty) / total_difficulty) as u64;
+            allocated = allocated.saturating_add(s);
+            s
+        };
+        if sats > 0 {
+            payouts.push(payout_plugins::MinerBalance {
+                miner_id: address.to_string(),
+                sats,
+            });
+        }
+    }
+    payouts
 }

@@ -1,6 +1,6 @@
 //! Registry that fans block events out to plugins and drives payouts.
 
-use crate::payout_plugins::traits::{PluginContext, PayoutPlugin};
+use crate::payout_plugins::traits::{PayoutPlugin, PluginContext};
 use std::sync::Arc;
 use tokio::sync::watch;
 
@@ -11,7 +11,9 @@ pub struct PayoutPluginRegistry {
 
 impl PayoutPluginRegistry {
     pub fn new() -> Self {
-        Self { plugins: Vec::new() }
+        Self {
+            plugins: Vec::new(),
+        }
     }
 
     /// Build a registry from env config. Each plugin enables itself by
@@ -23,26 +25,17 @@ impl PayoutPluginRegistry {
                 .map_err(|e| format!("opening payout ledger: {e}"))?,
         );
         let mut registry = Self::new();
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::payout_plugins::lightning::LightningPlugin::from_env(ledger.clone())
-        })) {
-            Ok(Ok(p)) => registry.register(Arc::new(p)),
-            Ok(Err(e)) => tracing::info!("Lightning plugin disabled: {e}"),
-            Err(_) => tracing::warn!("Lightning plugin init panicked — skipped"),
+        match crate::payout_plugins::lightning::LightningPlugin::from_env(ledger.clone()) {
+            Ok(p) => registry.register(Arc::new(p)),
+            Err(e) => tracing::info!("Lightning plugin disabled: {e}"),
         }
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::payout_plugins::cashu::CashuPlugin::from_env(ledger.clone())
-        })) {
-            Ok(Ok(p)) => registry.register(Arc::new(p)),
-            Ok(Err(e)) => tracing::info!("Cashu plugin disabled: {e}"),
-            Err(_) => tracing::warn!("Cashu plugin init panicked — skipped"),
+        match crate::payout_plugins::cashu::CashuPlugin::from_env(ledger.clone()) {
+            Ok(p) => registry.register(Arc::new(p)),
+            Err(e) => tracing::info!("Cashu plugin disabled: {e}"),
         }
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::payout_plugins::fedimint::FedimintPlugin::from_env(ledger)
-        })) {
-            Ok(Ok(p)) => registry.register(Arc::new(p)),
-            Ok(Err(e)) => tracing::info!("Fedimint plugin disabled: {e}"),
-            Err(_) => tracing::warn!("Fedimint plugin init panicked — skipped"),
+        match crate::payout_plugins::fedimint::FedimintPlugin::from_env(ledger) {
+            Ok(p) => registry.register(Arc::new(p)),
+            Err(e) => tracing::info!("Fedimint plugin disabled: {e}"),
         }
         Ok(registry)
     }
@@ -64,18 +57,32 @@ impl PayoutPluginRegistry {
     }
 
     /// Spawn the payout loop: on `interval`, each plugin drains balances
-    /// at/above its threshold. Runs until `shutdown` flips to `true`.
-    pub async fn run_payout_loop(&self, interval: std::time::Duration, shutdown: watch::Receiver<bool>) {
+    /// at/above its threshold. Runs until `shutdown` flips to `true` or
+    /// the shutdown sender is dropped (sender dropped = the pool is
+    /// shutting down; treat it as a stop signal, not a keep-alive).
+    pub async fn run_payout_loop(
+        &self,
+        interval: std::time::Duration,
+        shutdown: watch::Receiver<bool>,
+    ) {
         let mut shutdown_rx = shutdown;
         let mut tick = tokio::time::interval(interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = tick.tick() => {}
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
-                        tracing::info!("Payout loop shutting down");
-                        return;
+                changed = shutdown_rx.changed() => {
+                    match changed {
+                        // Sender dropped: the process is going away.
+                        Err(_) => {
+                            tracing::info!("Payout loop shutting down (shutdown sender dropped)");
+                            return;
+                        }
+                        Ok(()) if *shutdown_rx.borrow() => {
+                            tracing::info!("Payout loop shutting down");
+                            return;
+                        }
+                        Ok(()) => {}
                     }
                 }
             }
@@ -123,7 +130,8 @@ mod tests {
             "counting"
         }
         fn on_block(&self, _ctx: &PluginContext) {
-            self.blocks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.blocks
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
         fn threshold_sats(&self) -> u64 {
             0
@@ -133,9 +141,6 @@ mod tests {
                 miner_id: "x".into(),
                 sats: 1,
             }])
-        }
-        async fn run(&self, _shutdown: tokio::sync::watch::Receiver<bool>) -> Result<(), PluginError> {
-            Ok(())
         }
         fn balances(&self) -> HashMap<String, u64> {
             HashMap::new()
@@ -161,9 +166,46 @@ mod tests {
             block_reward_sats: 312_500_000,
             miner_payouts: vec![],
         });
-        assert_eq!(
-            plugin.blocks.load(std::sync::atomic::Ordering::SeqCst),
-            2
-        );
+        assert_eq!(plugin.blocks.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn payout_loop_exits_on_shutdown_true() {
+        let registry = std::sync::Arc::new(PayoutPluginRegistry::new());
+        let (tx, rx) = watch::channel(false);
+        let loop_task = {
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                registry
+                    .run_payout_loop(std::time::Duration::from_millis(10), rx)
+                    .await
+            })
+        };
+        tx.send(true).unwrap();
+        // Must return promptly once shutdown flips true.
+        tokio::time::timeout(std::time::Duration::from_secs(2), loop_task)
+            .await
+            .expect("loop must exit on shutdown=true")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn payout_loop_exits_when_sender_dropped() {
+        let registry = std::sync::Arc::new(PayoutPluginRegistry::new());
+        let (tx, rx) = watch::channel(false);
+        let loop_task = {
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                registry
+                    .run_payout_loop(std::time::Duration::from_millis(10), rx)
+                    .await
+            })
+        };
+        drop(tx);
+        // Sender dropped must be treated as shutdown, not keep-alive.
+        tokio::time::timeout(std::time::Duration::from_secs(2), loop_task)
+            .await
+            .expect("loop must exit when the shutdown sender is dropped")
+            .unwrap();
     }
 }
