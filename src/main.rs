@@ -36,11 +36,12 @@ use p2poolv2_lib::stratum::zmq_listener::{ZmqListener, ZmqListenerTrait};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{error, info, trace};
+use tracing::{error, info, trace, warn};
 
 use crate::signal::{ShutdownReason, setup_signal_handler};
 
 mod background_tasks;
+mod payout_plugins;
 mod signal;
 
 /// Interval in seconds to poll for new block templates since the last zmq event signal
@@ -326,6 +327,29 @@ async fn main() -> ExitCode {
         "API server started on host {} port {}",
         config.api.hostname, config.api.port
     );
+
+    // Payout plugins: Lightning / Cashu / Fedimint out-of-band payouts.
+    // Enabled independently by their env config; all disabled = no-op.
+    let plugin_shutdown_tx = tokio::sync::watch::channel(false).0;
+    match payout_plugins::registry::PayoutPluginRegistry::from_env(
+        std::path::PathBuf::from(&config.store.path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("payout-ledger.jsonl"),
+    ) {
+        Ok(registry) if !registry.is_empty() => {
+            let registry = std::sync::Arc::new(registry);
+            let shutdown_rx = plugin_shutdown_tx.subscribe();
+            tokio::spawn(async move {
+                registry
+                    .run_payout_loop(Duration::from_secs(60), shutdown_rx)
+                    .await;
+            });
+            info!("Payout plugins active");
+        }
+        Ok(_) => info!("No payout plugins configured"),
+        Err(e) => warn!("Payout plugins unavailable: {e}"),
+    }
 
     let mut exit_receiver = exit_sender.subscribe();
     let stop_all = async move |reason: ShutdownReason| -> ShutdownReason {

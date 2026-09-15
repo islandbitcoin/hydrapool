@@ -41,6 +41,13 @@ p2poolv2_lib = { git = "https://github.com/p2poolv2/p2poolv2", package = "p2pool
 p2poolv2_cli = { git = "https://github.com/p2poolv2/p2poolv2", package = "p2poolv2_cli", tag = "v0.12.0" }
 p2poolv2_api = { git = "https://github.com/p2poolv2/p2poolv2", package = "p2poolv2_api", tag = "v0.12.0" }
 bitcoindrpc = { git = "https://github.com/p2poolv2/p2poolv2", package = "bitcoindrpc", tag = "v0.12.0" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+async-trait = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
 
 # p2poolv2_lib = { path = "../p2poolv2/p2poolv2_lib/" }
 # p2poolv2_cli = { path = "../p2poolv2/p2poolv2_cli/" }
