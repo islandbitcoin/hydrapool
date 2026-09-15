@@ -122,14 +122,16 @@ impl CashuPlugin {
     }
 
     /// NUT-04: create a mint quote, then request blind signatures.
-    /// Returns the minted payload to hand to the miner.
+    /// Returns `(minted payload, quote id)` — the payload is handed to
+    /// the miner, the quote id is the backend receipt (`idem_key`) the
+    /// ledger stamps for reconciliation against the mint.
     ///
     /// NOTE: `outputs` is a placeholder until the cdk crate lands; the
     /// mint will reject empty output lists or return signatures that
     /// cannot be redeemed. The returned value is the raw mint response,
     /// recorded to the ledger for reconciliation — it is NOT a
     /// spendable NUT-00 token.
-    async fn mint_ecash(&self, sats: u64) -> Result<String, PluginError> {
+    async fn mint_ecash(&self, sats: u64) -> Result<(String, String), PluginError> {
         // Step 1: quote — POST /v1/mint/quote/bolt64
         let quote_resp = self
             .client
@@ -180,8 +182,9 @@ impl CashuPlugin {
             .map_err(|e| PluginError::Backend(format!("cashu mint json: {e}")))?;
 
         // Persist the minted payload verbatim (token serialization /
-        // keyset handling comes with the wallet layer).
-        Ok(signatures.to_string())
+        // keyset handling comes with the wallet layer), alongside the
+        // quote id as the backend receipt.
+        Ok((signatures.to_string(), quote_id.to_string()))
     }
 
     /// Deliver an ecash payload to the miner's secret ntfy topic. The
@@ -262,6 +265,10 @@ impl PayoutPlugin for CashuPlugin {
         "cashu"
     }
 
+    fn env_prefix(&self) -> &'static str {
+        "HYDRA_CASHU"
+    }
+
     fn on_block(&self, ctx: &PluginContext) {
         for payout in &ctx.miner_payouts {
             if let Err(e) =
@@ -332,7 +339,7 @@ impl PayoutPlugin for CashuPlugin {
                 continue;
             }
             match self.mint_ecash(balance.sats).await {
-                Ok(token) => {
+                Ok((token, quote_id)) => {
                     // Attach the minted payload to the STILL-OPEN intent
                     // before delivery: if delivery fails (or we crash),
                     // the payload is recoverable from the ledger and the
@@ -355,11 +362,15 @@ impl PayoutPlugin for CashuPlugin {
                     }
                     match self.deliver(&balance.miner_id, &token).await {
                         Ok(()) => {
-                            match self.ledger.settle_payout(
+                            // Settle by the `minted:` payload (the intent
+                            // identifier re-delivery matches on), stamping
+                            // the mint quote id as the backend receipt
+                            // (`idem_key`) for reconciliation.
+                            match self.ledger.settle_payout_with_idem(
                                 "cashu",
                                 &balance.miner_id,
-                                balance.sats,
                                 &format!("minted:{token}"),
+                                &quote_id,
                             ) {
                                 Ok(_) => {
                                     tracing::info!(miner = %balance.miner_id, sats = balance.sats, "Cashu payout delivered");

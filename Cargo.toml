@@ -14,6 +14,16 @@ categories = ["cryptography::cryptocurrencies"]
 exclude=["tests"]
 default-run = "hydrapool"
 
+# Payout rails. Each feature gates one payout plugin's module and its
+# registration (see src/payout_plugins/mod.rs and
+# src/payout_plugins/registry.rs). Build a single-rail binary with e.g.
+# `cargo check --no-default-features --features ln`.
+[features]
+default = ["ln", "cashu", "fedimint"]
+ln = []
+cashu = []
+fedimint = []
+
 [profile.release]
 codegen-units = 1
 lto = "fat"

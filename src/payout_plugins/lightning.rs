@@ -374,6 +374,10 @@ impl PayoutPlugin for LightningPlugin {
         "lightning"
     }
 
+    fn env_prefix(&self) -> &'static str {
+        "HYDRA_LN"
+    }
+
     fn on_block(&self, ctx: &PluginContext) {
         for payout in &ctx.miner_payouts {
             if let Err(e) =

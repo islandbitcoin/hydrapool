@@ -12,6 +12,12 @@ pub struct MinerBalance {
 }
 
 /// Context passed to a plugin on each pool-found block.
+// Fields are consumed by rail plugins' on_block; the
+// all-rails-disabled build would otherwise flag them dead.
+#[cfg_attr(
+    not(any(feature = "ln", feature = "cashu", feature = "fedimint")),
+    allow(dead_code)
+)]
 #[derive(Debug, Clone)]
 pub struct PluginContext {
     /// Height of the pool-found block (from the mined template).
@@ -23,6 +29,12 @@ pub struct PluginContext {
 }
 
 /// Error type returned by plugin operations.
+// Which variants a given build constructs depends on which rail
+// features are compiled in; single-rail builds must not flag the rest.
+#[cfg_attr(
+    not(all(feature = "ln", feature = "cashu", feature = "fedimint")),
+    allow(dead_code)
+)]
 #[derive(Debug)]
 pub enum PluginError {
     /// Backend (mint, LN node, federation) unreachable or errored.
@@ -60,6 +72,9 @@ impl std::error::Error for PluginError {}
 /// backend, so the pending intent must stay open (rolling back here
 /// risks double-paying). Use for the payment-dispatch call itself and
 /// its response reads, never for pre-dispatch requests.
+// Used by the ln and fedimint rails; other single-rail builds would
+// otherwise flag it dead.
+#[cfg_attr(not(any(feature = "ln", feature = "fedimint")), allow(dead_code))]
 pub fn ambiguous_on_timeout(label: &'static str) -> impl Fn(reqwest::Error) -> PluginError {
     move |e: reqwest::Error| {
         if e.is_timeout() {
@@ -73,11 +88,17 @@ pub fn ambiguous_on_timeout(label: &'static str) -> impl Fn(reqwest::Error) -> P
 /// A payout plugin.
 ///
 /// The registry drives plugins: it calls [`PayoutPlugin::on_block`] on
-/// every pool-found block and [`PayoutPlugin::payout_due`] on a fixed
-/// interval (see [`crate::payout_plugins::registry`]). There is no
-/// per-plugin task lifecycle — long-lived work (polling invoice status,
-/// federation clients) should be added to the trait only when a real
-/// consumer exists.
+/// every pool-found block, and runs each plugin's
+/// [`PayoutPlugin::payout_due`] on a fixed interval via a dedicated
+/// per-rail drain task (see [`crate::payout_plugins::registry`]). The
+/// tick only signals the drain task, so a slow rail never delays
+/// another rail's tick. Because each rail has exactly one drain task,
+/// two concurrent drains of the SAME rail never happen; drains across
+/// DIFFERENT rails are concurrent and are safe because pending intents
+/// are per (plugin, miner) in the ledger and each rail only touches its
+/// own namespace. Long-lived work (polling invoice status, federation
+/// clients) should be added to the trait only when a real consumer
+/// exists.
 ///
 /// The plugin owns its destination mapping: how `miner_id` (the stratum
 /// username) resolves to a payout destination (invoice, npub keyset,
@@ -96,6 +117,13 @@ pub fn ambiguous_on_timeout(label: &'static str) -> impl Fn(reqwest::Error) -> P
 pub trait PayoutPlugin: Send + Sync {
     /// Plugin name, used in logs and metrics.
     fn name(&self) -> &'static str;
+
+    /// Env-var prefix for this plugin's configuration (e.g. `HYDRA_LN`,
+    /// `HYDRA_CASHU`, `HYDRA_FEDIMINT`). The registry derives per-rail
+    /// settings from it — currently the drain timeout
+    /// (`<prefix>_DRAIN_TIMEOUT_SECS`, see
+    /// [`crate::payout_plugins::registry`]).
+    fn env_prefix(&self) -> &'static str;
 
     /// Called on every pool-found block with the per-miner PPLNS
     /// distribution (already net of donation/fee cuts). Implementations

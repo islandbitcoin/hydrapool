@@ -13,7 +13,15 @@ use std::sync::Mutex;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct LedgerEntry {
     /// Plugin that owns this balance ("lightning", "cashu", "fedimint").
+    /// Kept for compatibility with existing ledger files; `rail` is the
+    /// forward-looking alias written on all new entries and is
+    /// currently identical to the plugin name.
     plugin: String,
+    /// Rail namespace for this entry — same value as `plugin` today
+    /// ("lightning", "cashu", "fedimint"). Replay accepts entries with
+    /// either or both fields; `rail` wins when both are present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rail: Option<String>,
     miner_id: String,
     /// Delta in sats: positive on accrual, negative on payout.
     delta_sats: i64,
@@ -29,6 +37,14 @@ struct LedgerEntry {
     pending: Option<PendingPayout>,
 }
 
+impl LedgerEntry {
+    /// The rail this entry belongs to: `rail` when present, else
+    /// `plugin` (v1 entries have only `plugin`).
+    fn rail_or_plugin(&self) -> &str {
+        self.rail.as_deref().unwrap_or(&self.plugin)
+    }
+}
+
 /// A payout dispatched but not yet settled. Written to the ledger
 /// BEFORE the payment is sent so a crash between pay and record leaves
 /// a recoverable trace instead of double-paying on the next tick.
@@ -38,11 +54,25 @@ pub struct PendingPayout {
     /// gateway operation_id, mint quote id). Empty when the backend
     /// has not yet assigned one.
     pub operation_id: String,
+    /// Backend receipt id captured at dispatch time when known
+    /// (payment hash / mint quote id / gateway operation id). Unlike
+    /// `operation_id` — which is filled in as the flow progresses and
+    /// is reused for `minted:` payloads — `idem_key` is stamped at
+    /// settle time as the canonical backend receipt for auditing and
+    /// manual backend reconciliation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idem_key: Option<String>,
     /// true once the backend confirmed the payment settled.
     pub confirmed: bool,
 }
 
 /// In-memory ledger state: plugin -> miner_id -> accrued sats.
+// Under non-default feature combos (e.g. no rails at all) most of the
+// ledger API has no in-tree caller — dead_code must not fire there.
+#[cfg_attr(
+    not(any(feature = "ln", feature = "cashu", feature = "fedimint")),
+    allow(dead_code)
+)]
 #[derive(Default)]
 pub struct Ledger {
     path: PathBuf,
@@ -52,6 +82,12 @@ pub struct Ledger {
 impl Ledger {
     /// Open (or create) the ledger at `path`, replaying any existing
     /// entries. Corrupt trailing lines (torn writes) are skipped.
+    // Most of this impl is called only by rail plugins; the
+    // all-rails-disabled build flags those methods dead.
+    #[cfg_attr(
+        not(any(feature = "ln", feature = "cashu", feature = "fedimint")),
+        allow(dead_code)
+    )]
     pub fn open(path: PathBuf) -> std::io::Result<Self> {
         let mut state: HashMap<(String, String), i64> = HashMap::new();
         if path.exists() {
@@ -64,7 +100,10 @@ impl Ledger {
                     tracing::warn!("Skipping unparseable ledger line: {line}");
                     continue;
                 };
-                *state.entry((entry.plugin, entry.miner_id)).or_insert(0) += entry.delta_sats;
+                // v1 entries carry only `plugin`; new entries also carry
+                // `rail` (same value today). `rail` wins when both exist.
+                let rail = entry.rail_or_plugin().to_string();
+                *state.entry((rail, entry.miner_id)).or_insert(0) += entry.delta_sats;
             }
         } else if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -76,6 +115,12 @@ impl Ledger {
     }
 
     /// Accrue `sats` for `miner_id` under `plugin` for block `height`.
+    // Called by rail plugins' on_block; the all-rails-disabled build
+    // would otherwise flag it dead.
+    #[cfg_attr(
+        not(any(feature = "ln", feature = "cashu", feature = "fedimint")),
+        allow(dead_code)
+    )]
     pub fn accrue(
         &self,
         plugin: &str,
@@ -83,17 +128,43 @@ impl Ledger {
         sats: u64,
         block_height: u32,
     ) -> std::io::Result<()> {
-        self.append(LedgerEntry {
-            plugin: plugin.to_string(),
-            miner_id: miner_id.to_string(),
-            delta_sats: sats as i64,
-            ts: now(),
+        self.append(Self::entry(
+            plugin,
+            miner_id,
+            sats as i64,
             block_height,
-            pending: None,
-        })
+            None,
+        ))
+    }
+
+    /// Build a ledger entry. `rail` is always written (forward-looking
+    /// alias, identical to `plugin` today); `pending` carries the
+    /// pending-intent marker when one applies.
+    fn entry(
+        plugin: &str,
+        miner_id: &str,
+        delta_sats: i64,
+        _block_height: u32,
+        pending: Option<PendingPayout>,
+    ) -> LedgerEntry {
+        LedgerEntry {
+            plugin: plugin.to_string(),
+            rail: Some(plugin.to_string()),
+            miner_id: miner_id.to_string(),
+            delta_sats,
+            ts: now(),
+            block_height: _block_height,
+            pending,
+        }
     }
 
     /// Peek balances for one plugin without mutating.
+    // Called by rail plugins' payout_due; the all-rails-disabled build
+    // would otherwise flag it dead.
+    #[cfg_attr(
+        not(any(feature = "ln", feature = "cashu", feature = "fedimint")),
+        allow(dead_code)
+    )]
     pub fn balances(&self, plugin: &str) -> HashMap<String, u64> {
         self.state
             .lock()
@@ -110,18 +181,24 @@ impl Ledger {
     /// error if the balance is insufficient. On success the miner's
     /// accrued balance is reduced; if the payment later fails, call
     /// [`Ledger::rollback_payout`] to restore it.
+    // Called by rail plugins' payout_due; the all-rails-disabled build
+    // would otherwise flag it dead.
+    #[cfg_attr(
+        not(any(feature = "ln", feature = "cashu", feature = "fedimint")),
+        allow(dead_code)
+    )]
     pub fn begin_payout(&self, plugin: &str, miner_id: &str, sats: u64) -> Result<u64, String> {
-        let entry = LedgerEntry {
-            plugin: plugin.to_string(),
-            miner_id: miner_id.to_string(),
-            delta_sats: -(sats as i64),
-            ts: now(),
-            block_height: 0,
-            pending: Some(PendingPayout {
+        let entry = Self::entry(
+            plugin,
+            miner_id,
+            -(sats as i64),
+            0,
+            Some(PendingPayout {
                 operation_id: String::new(),
+                idem_key: None,
                 confirmed: false,
             }),
-        };
+        );
         // Look up with borrowed keys — only allocate when the entry is
         // genuinely new (append_entry's entry() call).
         let new_balance = {
@@ -144,7 +221,16 @@ impl Ledger {
     /// `sats` is the amount that was paid (for log/audit parity with
     /// `begin_payout`); the accrued balance was already debited by
     /// `begin_payout`, so this only records the confirmation.
+    /// `idem_key` is the backend receipt id (payment hash / quote id /
+    /// operation id) when known — stamped onto the settle entry so
+    /// operators can reconcile against the backend by that key.
     /// Returns the remaining accrued balance.
+    // Called by rail plugins' payout_due; the all-rails-disabled build
+    // would otherwise flag it dead.
+    #[cfg_attr(
+        not(any(feature = "ln", feature = "cashu", feature = "fedimint")),
+        allow(dead_code)
+    )]
     pub fn settle_payout(
         &self,
         plugin: &str,
@@ -152,17 +238,34 @@ impl Ledger {
         _sats: u64,
         operation_id: &str,
     ) -> Result<u64, String> {
-        let entry = LedgerEntry {
-            plugin: plugin.to_string(),
-            miner_id: miner_id.to_string(),
-            delta_sats: 0,
-            ts: now(),
-            block_height: 0,
-            pending: Some(PendingPayout {
+        self.settle_payout_with_idem(plugin, miner_id, operation_id, operation_id)
+    }
+
+    /// Like [`Ledger::settle_payout`] but with an explicit idempotency
+    /// key distinct from `operation_id` (e.g. settle by an attached
+    /// `minted:` payload while stamping the mint quote id as the
+    /// backend receipt).
+    // Called by the cashu rail; other single-rail builds would
+    // otherwise flag it dead.
+    #[cfg_attr(not(feature = "cashu"), allow(dead_code))]
+    pub fn settle_payout_with_idem(
+        &self,
+        plugin: &str,
+        miner_id: &str,
+        operation_id: &str,
+        idem_key: &str,
+    ) -> Result<u64, String> {
+        let entry = Self::entry(
+            plugin,
+            miner_id,
+            0,
+            0,
+            Some(PendingPayout {
                 operation_id: operation_id.to_string(),
+                idem_key: Some(idem_key.to_string()),
                 confirmed: true,
             }),
-        };
+        );
         let balance = {
             let mut state = self.state.lock().unwrap();
             self.append_entry(&mut state, entry)
@@ -177,17 +280,17 @@ impl Ledger {
     /// why. Idempotent per call site — callers invoke this exactly once
     /// per failed payment.
     pub fn rollback_payout(&self, plugin: &str, miner_id: &str, sats: u64) -> Result<u64, String> {
-        let entry = LedgerEntry {
-            plugin: plugin.to_string(),
-            miner_id: miner_id.to_string(),
-            delta_sats: sats as i64,
-            ts: now(),
-            block_height: 0,
-            pending: Some(PendingPayout {
+        let entry = Self::entry(
+            plugin,
+            miner_id,
+            sats as i64,
+            0,
+            Some(PendingPayout {
                 operation_id: String::new(),
+                idem_key: None,
                 confirmed: true,
             }),
-        };
+        );
         let balance = {
             let mut state = self.state.lock().unwrap();
             self.append_entry(&mut state, entry)
@@ -219,25 +322,28 @@ impl Ledger {
                 let Ok(entry) = serde_json::from_str::<LedgerEntry>(&line) else {
                     continue;
                 };
-                let Some(p) = entry.pending else { continue };
+                let Some(ref p) = entry.pending else { continue };
+                // v1 entries carry only `plugin`; rail wins when both
+                // fields exist.
+                let rail = entry.rail_or_plugin().to_string();
                 if !p.confirmed && entry.delta_sats < 0 {
-                    open.push((entry.plugin, entry.miner_id, (-entry.delta_sats) as u64, p));
+                    open.push((rail, entry.miner_id, (-entry.delta_sats) as u64, p.clone()));
                 } else if !p.confirmed && entry.delta_sats == 0 && !p.operation_id.is_empty() {
                     // Payload attach: record it on the most recent open
-                    // intent for this (plugin, miner).
+                    // intent for this (rail, miner).
                     if let Some(slot) = open
                         .iter_mut()
                         .rev()
-                        .find(|(pl, m, _, _)| *pl == entry.plugin && *m == entry.miner_id)
+                        .find(|(pl, m, _, _)| *pl == rail && *m == entry.miner_id)
                     {
-                        slot.3.operation_id = p.operation_id;
+                        slot.3.operation_id = p.operation_id.clone();
                     }
                 } else if p.confirmed {
                     // A settle (delta 0) or rollback (delta > 0) closes
                     // the oldest open pending debit for this miner.
                     if let Some(pos) = open
                         .iter()
-                        .position(|(pl, m, _, _)| *pl == entry.plugin && *m == entry.miner_id)
+                        .position(|(pl, m, _, _)| *pl == rail && *m == entry.miner_id)
                     {
                         open.remove(pos);
                     }
@@ -253,23 +359,26 @@ impl Ledger {
     /// leaves the payload recoverable from the ledger — re-deliver it,
     /// never re-mint. No-op on balances; must be called between
     /// `begin_payout` and `settle_payout`/`rollback_payout`.
+    // Only the cashu rail calls this; other single-rail builds would
+    // otherwise flag it dead.
+    #[cfg_attr(not(feature = "cashu"), allow(dead_code))]
     pub fn attach_pending_payload(
         &self,
         plugin: &str,
         miner_id: &str,
         payload: &str,
     ) -> std::io::Result<()> {
-        self.append(LedgerEntry {
-            plugin: plugin.to_string(),
-            miner_id: miner_id.to_string(),
-            delta_sats: 0,
-            ts: now(),
-            block_height: 0,
-            pending: Some(PendingPayout {
+        self.append(Self::entry(
+            plugin,
+            miner_id,
+            0,
+            0,
+            Some(PendingPayout {
                 operation_id: payload.to_string(),
+                idem_key: None,
                 confirmed: false,
             }),
-        })
+        ))
     }
 
     /// Startup reconciliation for stranded pending payouts.
@@ -285,13 +394,27 @@ impl Ledger {
     pub fn stranded_pending_payouts(&self) -> Vec<(String, String, u64, PendingPayout)> {
         let open = self.pending_payouts();
         for (plugin, miner, sats, pending) in &open {
-            tracing::error!(
-                plugin = %plugin,
-                miner = %miner,
-                sats = sats,
-                operation_id = %pending.operation_id,
-                "STRANDED PAYOUT from a previous run: balance debited, payment state unknown — reconcile against the backend by operation_id"
-            );
+            // An intent that already carries an idem_key can be
+            // reconciled directly against the backend by that receipt
+            // id — surface it prominently for the operator.
+            if let Some(idem) = &pending.idem_key {
+                tracing::error!(
+                    plugin = %plugin,
+                    miner = %miner,
+                    sats = sats,
+                    operation_id = %pending.operation_id,
+                    idem_key = %idem,
+                    "STRANDED PAYOUT from a previous run: balance debited, payment state unknown — reconcile against the backend by idem_key/operation_id"
+                );
+            } else {
+                tracing::error!(
+                    plugin = %plugin,
+                    miner = %miner,
+                    sats = sats,
+                    operation_id = %pending.operation_id,
+                    "STRANDED PAYOUT from a previous run: balance debited, payment state unknown — reconcile against the backend by operation_id"
+                );
+            }
         }
         open
     }
@@ -333,6 +456,12 @@ fn now() -> u64 {
 /// `HashMap::get` on a `(String, String)` key requires an owned pair,
 /// so a linear scan is the allocation-free option — at pool scale
 /// (~100 miners) it beats two String builds per call.
+// Free functions in this module are called only by rail plugins; the
+// all-rails-disabled build flags them dead.
+#[cfg_attr(
+    not(any(feature = "ln", feature = "cashu", feature = "fedimint")),
+    allow(dead_code)
+)]
 fn borrowed_balance(state: &HashMap<(String, String), i64>, plugin: &str, miner_id: &str) -> i64 {
     state
         .iter()
@@ -341,6 +470,12 @@ fn borrowed_balance(state: &HashMap<(String, String), i64>, plugin: &str, miner_
 }
 
 /// Convert raw balances into [`MinerBalance`] list, dropping zero entries.
+// Free functions in this module are called only by rail plugins; the
+// all-rails-disabled build flags them dead.
+#[cfg_attr(
+    not(any(feature = "ln", feature = "cashu", feature = "fedimint")),
+    allow(dead_code)
+)]
 pub fn to_miner_balances(balances: HashMap<String, u64>) -> Vec<MinerBalance> {
     balances
         .into_iter()
@@ -355,6 +490,12 @@ pub fn to_miner_balances(balances: HashMap<String, u64>) -> Vec<MinerBalance> {
 /// may still settle, so the pending intent stays OPEN for
 /// reconciliation; any definite pre-dispatch failure rolls the intent
 /// back, restoring the balance so the next pass retries cleanly.
+// Free functions in this module are called only by rail plugins; the
+// all-rails-disabled build flags them dead.
+#[cfg_attr(
+    not(any(feature = "ln", feature = "cashu", feature = "fedimint")),
+    allow(dead_code)
+)]
 pub fn rollback_on_definite_failure(
     ledger: &Ledger,
     plugin: &str,
@@ -614,5 +755,82 @@ mod tests {
         assert_eq!(stranded[0].2, 1_200);
         // Balance stays debited — no double-credit, operator reconciles.
         assert_eq!(reopened.balances("lightning").get("minerC"), Some(&800));
+    }
+
+    /// A v1 ledger file has no `rail` field and no `idem_key` on
+    /// pending payouts; replay must accept it cleanly and key state by
+    /// `plugin`.
+    #[test]
+    fn v1_ledger_file_without_rail_or_idem_replays() {
+        let dir = std::env::temp_dir().join(format!(
+            "hydrapool-v1-{}-{}",
+            std::process::id(),
+            test_dir_nonce()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ledger.jsonl");
+        // Hand-written v1 entries: accrual + open pending debit +
+        // confirmed settle, all without `rail` or `idem_key`.
+        let v1_lines = [
+            serde_json::json!({
+                "plugin": "lightning", "miner_id": "v1miner",
+                "delta_sats": 5_000, "ts": 1_700_000_000, "block_height": 10,
+            })
+            .to_string(),
+            serde_json::json!({
+                "plugin": "lightning", "miner_id": "v1miner",
+                "delta_sats": -2_000, "ts": 1_700_000_100, "block_height": 0,
+                "pending": {"operation_id": "", "confirmed": false},
+            })
+            .to_string(),
+            serde_json::json!({
+                "plugin": "cashu", "miner_id": "v1cashu",
+                "delta_sats": 1_000, "ts": 1_700_000_200, "block_height": 11,
+            })
+            .to_string(),
+        ];
+        std::fs::write(&path, v1_lines.join("\n") + "\n").unwrap();
+        let ledger = Ledger::open(path).unwrap();
+        assert_eq!(ledger.balances("lightning").get("v1miner"), Some(&3_000));
+        assert_eq!(ledger.balances("cashu").get("v1cashu"), Some(&1_000));
+        // The open v1 pending debit still surfaces for reconciliation.
+        let pending = ledger.pending_payouts();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, "lightning");
+        assert_eq!(pending[0].1, "v1miner");
+        assert_eq!(pending[0].2, 2_000);
+        assert!(pending[0].3.idem_key.is_none());
+    }
+
+    #[test]
+    fn settle_stamps_idem_key_and_stranded_logs_it() {
+        let ledger = tmp_ledger();
+        ledger.accrue("fedimint", "minerI", 1_000, 1).unwrap();
+        ledger.begin_payout("fedimint", "minerI", 400).unwrap();
+        ledger
+            .settle_payout_with_idem("fedimint", "minerI", "intent-op", "gateway-op-77")
+            .unwrap();
+        // Settled — no open intents, and the idem_key is recorded on
+        // the (closed) settle entry in the file for audit.
+        assert!(ledger.pending_payouts().is_empty());
+        let dir = ledger.path.parent().unwrap().to_path_buf();
+        let file = std::fs::read_to_string(ledger.path.clone()).unwrap();
+        assert!(
+            file.contains("\"idem_key\":\"gateway-op-77\""),
+            "settle entry must stamp the idem_key; file:\n{file}"
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn new_entries_carry_rail_alias() {
+        let ledger = tmp_ledger();
+        ledger.accrue("cashu", "minerR", 500, 3).unwrap();
+        let file = std::fs::read_to_string(ledger.path.clone()).unwrap();
+        assert!(
+            file.contains("\"rail\":\"cashu\""),
+            "new entries must carry the rail alias; file: {file}"
+        );
     }
 }

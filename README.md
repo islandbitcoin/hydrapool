@@ -280,6 +280,72 @@ To expose the API Server to public, we recommend using nginx as a
 reverse proxy for the port, just like for the prometheus/grafana
 dashboard.
 
+<a id="payout-plugins"></a>
+# Payout Plugins (Lightning, Cashu, Fedimint)
+
+Payout plugins extend payouts beyond the on-chain coinbase: a miner's
+share of each pool-found block accrues into a ledger (the same
+donation/fee cuts and PPLNS split the coinbase uses), and each rail
+drains balances at or above its threshold out-of-band — Lightning via
+LNURL-pay, Cashu via minted ecash tokens delivered over ntfy, Fedimint
+via a federation gateway. Every rail has its own drain task on a 60s
+tick, so a slow rail never delays the others; failed drains retry with
+exponential backoff, and a rail that fails 5 times in a row is marked
+degraded (accrual continues, drains pause until it recovers). A
+payment dispatched but not settled is bracketed by pending-intent
+ledger entries and reconciled on restart instead of re-paid.
+
+## Environment variables
+
+Each rail enables itself when its primary env var is set
+(`HYDRA_LN_API_URL`, `HYDRA_CASHU_MINT_URL`, or
+`HYDRA_FEDIMINT_GATEWAY_API`); with none set the pool pays on-chain
+only.
+
+| Env var | Default | Meaning |
+|---------|---------|---------|
+| `HYDRA_LN_API_URL` | (unset = rail off) | LND REST base URL, e.g. `https://127.0.0.1:8080` |
+| `HYDRA_LN_API_MACAROON` | none | Hex macaroon for the pool's LN node |
+| `HYDRA_LN_THRESHOLD_SATS` | `50000` | Drain a miner's Lightning balance at/above this many sats |
+| `HYDRA_LN_DESTINATIONS` | (empty) | JSON map `{"username": "user@host"}` of Lightning Addresses |
+| `HYDRA_LN_DRAIN_TIMEOUT_SECS` | `120` | Per-drain timeout for the Lightning rail |
+| `HYDRA_CASHU_MINT_URL` | (unset = rail off) | Cashu mint REST base URL, e.g. `https://mint.example.com` |
+| `HYDRA_CASHU_THRESHOLD_SATS` | `10000` | Drain threshold in sats for the Cashu rail |
+| `HYDRA_CASHU_DESTINATIONS` | (empty) | JSON map `{"username": "<topic>:<topic access token>"}` of ntfy delivery targets |
+| `HYDRA_CASHU_ALLOW_NUT04_PROBE` | `false` | Opt into the mint API probe (payouts are NOT redeemable until the cdk wallet integration lands) |
+| `HYDRA_CASHU_DRAIN_TIMEOUT_SECS` | `120` | Per-drain timeout for the Cashu rail |
+| `HYDRA_FEDIMINT_GATEWAY_API` | (unset = rail off) | Fedimint gateway REST endpoint |
+| `HYDRA_FEDIMINT_INVITE_CODE` | none | Federation the pool pays from |
+| `HYDRA_FEDIMINT_THRESHOLD_SATS` | `10000` | Drain threshold in sats for the Fedimint rail |
+| `HYDRA_FEDIMINT_DESTINATIONS` | (empty) | JSON map `{"username": "<fedimint receive invite / gateway op id>"}` |
+| `HYDRA_FEDIMINT_DRAIN_TIMEOUT_SECS` | `120` | Per-drain timeout for the Fedimint rail |
+
+(The three timeout vars are new with parallel drains; the other
+per-rail variables predate this section.)
+
+## Destination format per rail
+
+- **Lightning** — a Lightning Address (`user@host`, resolved via
+  `.well-known/lnurlp`) or a full `http(s)://` LNURL-pay callback URL.
+  Only usernames present in `HYDRA_LN_DESTINATIONS` resolve; a raw
+  stratum username is never treated as an address.
+- **Cashu** — `<ntfy topic>:<topic access token>`. The topic must be
+  reserved/ACL'd (non-public) — anyone who can subscribe to a public
+  ntfy.sh topic can read the bearer ecash — and the bare form
+  `hydrapool-<username>` is refused at config load.
+- **Fedimint** — the federation receive invite / gateway operation id
+  the miner registered, passed through to the gateway's `/credit`
+  endpoint.
+
+## Custody
+
+Accrual is non-custodial in the same sense as the on-chain payout:
+nothing is credited to anyone until the pool pays. Between accrual and
+drain, however, the operator holds hot balances — an LN node wallet, a
+pre-funded Cashu mint, a Fedimint gateway wallet — so keep drain
+thresholds high (the defaults are 50k/10k/10k sats) to limit what a
+compromised hot wallet can take, and reconcile the payout ledger's
+pending intents after every restart.
 
 # Other Options to Run Hydrapool
 
